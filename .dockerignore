@@ -1,0 +1,19 @@
+# Version control
+.git
+.gitignore
+
+# Build artifacts (rebuilt inside the image)
+.next
+node_modules
+out
+
+# Local / editor / OS
+.env*
+.vscode
+.idea
+.DS_Store
+npm-debug.log*
+
+# Docs & misc not needed for the build
+*.md
+!README.md

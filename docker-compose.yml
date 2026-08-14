@@ -1,0 +1,22 @@
+# Deploy on your Aliyun ECS. Pull the image built by ACR, then `docker compose up -d`.
+services:
+  pi-web:
+    # Replace with your ACR image address + tag (see the repo's 操作指南 page).
+    image: crpi-eiqk1i70nlck3uul.cn-beijing.personal.cr.aliyuncs.com/<namespace>/pi-web:latest
+    container_name: pi-web
+    restart: unless-stopped
+    ports:
+      - "30141:30141"
+    environment:
+      # REQUIRED when exposed to the internet. Username is always "pi".
+      PI_WEB_PASSWORD: "change-me-to-a-long-random-secret"
+      # If you access through a domain / reverse proxy, list the exact hostname(s)
+      # here, comma-separated. Accessing by raw IP does NOT need this.
+      # PI_WEB_ALLOWED_HOSTS: "pi.example.com"
+    volumes:
+      # Persists pi state: ~/.pi (sessions/auth/models), ~/.agents (skills),
+      # and any ~/pi-cwd-* working directories. HOME is /data inside the image.
+      - pi-web-data:/data
+
+volumes:
+  pi-web-data:
