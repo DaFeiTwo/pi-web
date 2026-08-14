@@ -1,16 +1,27 @@
+# Version control
 .git
+.gitignore
 .github
+# Build artifacts (rebuilt inside the image)
+.next
+node_modules
+out
+coverage
+test-results
+*.tsbuildinfo
+next-env.d.ts
+# Not needed in the image
 .claude
 demo
 e2e
-.next
-node_modules
-coverage
-test-results
-.env
-.env.*
-!.env.example
-.DS_Store
-*.tsbuildinfo
-next-env.d.ts
 workspace
+# Local / editor / OS
+.env*
+!.env.example
+.vscode
+.idea
+.DS_Store
+npm-debug.log*
+# Docs & misc not needed for the build
+*.md
+!README.md
