@@ -13,9 +13,10 @@ RUN npm ci
 COPY . .
 RUN npm run build
 
-# Drop dev dependencies so the runtime image only carries what `next start` needs.
-# (Client-side libs like react-markdown/mermaid are already bundled into .next.)
-RUN npm prune --omit=dev
+# NOTE: we intentionally do NOT run `npm prune --omit=dev`.
+# `next start` loads next.config.ts at runtime, which Next parses via `jiti`
+# (pulled in as a dev dependency through @tailwindcss/node). Pruning dev deps
+# removes jiti and makes startup fail with "Cannot find module 'jiti'".
 
 
 # ---------- Stage 2: runtime ----------
