@@ -1,8 +1,7 @@
 # Deploy on your Aliyun ECS. Pull the image built by ACR, then `docker compose up -d`.
 services:
   pi-web:
-    # Replace with your ACR image address + tag (see the repo's 操作指南 page).
-    image: crpi-eiqk1i70nlck3uul.cn-beijing.personal.cr.aliyuncs.com/<namespace>/pi-web:latest
+    image: crpi-eiqk1i70nlck3uul.cn-beijing.personal.cr.aliyuncs.com/stock_analysis/pi-web:latest
     container_name: pi-web
     restart: unless-stopped
     ports:
