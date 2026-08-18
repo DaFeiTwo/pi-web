@@ -260,6 +260,7 @@ export const zhTWLocale: LocalePlugin = {
     "sidebar.new": "新增",
     "sidebar.newSessionTitle": "在 {path} 中新增工作階段",
     "sidebar.refresh": "重新整理",
+    "sidebar.sourceRepo": "在 GitHub 檢視原始碼",
     "sidebar.selectProject": "選擇專案…",
     "sidebar.filterProjects": "篩選專案…",
     "sidebar.noMatchingProjects": "找不到相符的專案",

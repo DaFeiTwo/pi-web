@@ -260,6 +260,7 @@ export const enLocale: LocalePlugin = {
     "sidebar.new": "New",
     "sidebar.newSessionTitle": "New session in {path}",
     "sidebar.refresh": "Refresh",
+    "sidebar.sourceRepo": "View source on GitHub",
     "sidebar.selectProject": "Select project…",
     "sidebar.filterProjects": "Filter projects…",
     "sidebar.noMatchingProjects": "No matching projects",

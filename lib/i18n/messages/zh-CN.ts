@@ -260,6 +260,7 @@ export const zhCNLocale: LocalePlugin = {
     "sidebar.new": "新建",
     "sidebar.newSessionTitle": "在 {path} 中新建会话",
     "sidebar.refresh": "刷新",
+    "sidebar.sourceRepo": "在 GitHub 查看源码",
     "sidebar.selectProject": "选择项目…",
     "sidebar.filterProjects": "筛选项目…",
     "sidebar.noMatchingProjects": "没有匹配的项目",
