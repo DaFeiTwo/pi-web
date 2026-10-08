@@ -6,7 +6,12 @@ FROM node:22-bookworm-slim AS builder
 WORKDIR /app
 
 # Install full dependencies (dev deps are needed by `next build`).
+# bin/ must be copied BEFORE `npm ci`: package.json declares
+# `postinstall: node bin/prepare-terminal.js`, so npm runs that file as part of
+# the install. Without this, `npm ci` fails with MODULE_NOT_FOUND on
+# /app/bin/prepare-terminal.js. bin/ rarely changes, so layer caching still holds.
 COPY package.json package-lock.json* ./
+COPY bin ./bin
 RUN npm ci
 
 # Copy the rest of the source and build the production bundle.
