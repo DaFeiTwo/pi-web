@@ -1,7 +1,13 @@
 /* pi-hermes-memory viewer (fork-only feature). Every class starts with hm-. */
 
+/* globals.css fixes html/body to the viewport with overflow hidden (the chat
+   scrolls inside its panels), so this page is its own scroll container. */
 .hm-page {
-  min-height: 100dvh;
+  flex: 1;
+  min-height: 0;
+  overflow-y: auto;
+  overscroll-behavior: contain;
+  -webkit-overflow-scrolling: touch;
   background: var(--bg);
   color: var(--text);
   font-family: var(--font-ui, inherit);
