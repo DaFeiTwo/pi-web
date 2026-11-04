@@ -88,4 +88,5 @@ export function proxy(request: NextRequest) {
   return NextResponse.next();
 }
 
-export const config = { matcher: ["/", "/login", "/api/:path*"] };
+// "/memory": the fork's pi-hermes-memory viewer (app/memory).
+export const config = { matcher: ["/", "/login", "/memory", "/api/:path*"] };

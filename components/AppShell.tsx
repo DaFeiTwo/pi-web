@@ -12,6 +12,7 @@ import { TabBar, type Tab } from "./TabBar";
 import { movePanelTab, orderPanelTabs } from "@/lib/panel-tab-order";
 import { openFileTab, saveFileViewerState, saveParkedFileViewerState, switchFileWorkspace, type ParkedFileWorkspace } from "./file-tab-state";
 import { SettingsPanel, SettingsSectionIcon } from "./SettingsPanel";
+import { MemoryEntryButton } from "./hermes-memory/MemoryEntryButton";
 import { ProjectTrustDialog, type ProjectTrustFailure } from "./ProjectTrustDialog";
 import { BranchNavigator, hasSessionBranches } from "./BranchNavigator";
 import { SystemPromptPanel } from "./SystemPromptPanel";
@@ -1652,6 +1653,7 @@ export function AppShell() {
             </button>
           );
         })}
+        <MemoryEntryButton />
         <button
           type="button"
           onClick={() => {

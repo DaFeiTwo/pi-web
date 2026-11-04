@@ -49,7 +49,7 @@ feat/xxx ──PR──────────────▶ deploy ──push
 
 - `Dockerfile`、`.dockerignore` —— 我们自己的容器构建配置。上游现在也有这两个文件，但内容不同（上游用 `HOME=/home/node`、`node` 用户、剪掉 dev 依赖），**`deploy` 上始终保留我们的版本**，否则线上 `/data` 卷里的会话、凭据、模型配置会读不到。
 - `docker-compose.yml` —— 仓库里这份只是参考；**服务器上实际用的是另一份**，和仓库里的不同。上游的 `compose.yaml`（按源码构建）也会随 `main` 进入 `deploy`，服务器上用不到它。
-- 自己开发的功能（如新会话页 "Pi Web" 旁的 GitHub 源码链接），通过 PR 合入。
+- 自己开发的功能（如新会话页 "Pi Web" 旁的 GitHub 源码链接、[记忆页面](hermes-memory.md)），通过 PR 合入。
 
 ### 用 merge 让 deploy 吸收 main 的更新
 
