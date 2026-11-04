@@ -1,0 +1,299 @@
+/* pi-hermes-memory viewer (fork-only feature). Every class starts with hm-. */
+
+.hm-page {
+  min-height: 100dvh;
+  background: var(--bg);
+  color: var(--text);
+  font-family: var(--font-ui, inherit);
+}
+
+.hm-header {
+  position: sticky;
+  top: 0;
+  z-index: 2;
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: calc(10px + env(safe-area-inset-top)) 16px 10px;
+  background: var(--bg-panel);
+  border-bottom: 1px solid var(--border);
+}
+
+.hm-heading {
+  flex: 1;
+  min-width: 0;
+}
+
+.hm-heading h1 {
+  margin: 0;
+  font-size: 16px;
+  font-weight: 600;
+}
+
+.hm-heading p {
+  margin: 2px 0 0;
+  font-size: 12px;
+  color: var(--text-muted);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.hm-icon-button,
+.hm-button {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  flex-shrink: 0;
+  border: 1px solid var(--border);
+  background: var(--bg);
+  color: var(--text);
+  cursor: pointer;
+  border-radius: 8px;
+  transition: background 0.12s, color 0.12s;
+}
+
+.hm-icon-button {
+  width: 34px;
+  height: 34px;
+  padding: 0;
+}
+
+.hm-button {
+  height: 32px;
+  padding: 0 12px;
+  font-size: 12px;
+}
+
+.hm-icon-button:hover,
+.hm-button:hover:not(:disabled) {
+  background: var(--bg-hover);
+}
+
+.hm-button:disabled {
+  opacity: 0.6;
+  cursor: default;
+}
+
+.hm-body {
+  max-width: 860px;
+  margin: 0 auto;
+  padding: 16px 16px calc(24px + env(safe-area-inset-bottom));
+}
+
+.hm-tabs {
+  display: flex;
+  gap: 4px;
+  overflow-x: auto;
+  border-bottom: 1px solid var(--border);
+  margin-bottom: 14px;
+}
+
+.hm-tab {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  flex-shrink: 0;
+  height: 36px;
+  padding: 0 12px;
+  border: none;
+  border-bottom: 2px solid transparent;
+  background: none;
+  color: var(--text-muted);
+  font-size: 13px;
+  cursor: pointer;
+}
+
+.hm-tab:hover {
+  color: var(--text);
+}
+
+.hm-tab.is-active {
+  color: var(--text);
+  border-bottom-color: var(--accent);
+  font-weight: 500;
+}
+
+.hm-tab-count {
+  min-width: 18px;
+  padding: 0 5px;
+  border-radius: 9px;
+  background: var(--bg-hover);
+  color: var(--text-muted);
+  font-size: 11px;
+  line-height: 18px;
+  text-align: center;
+}
+
+.hm-description {
+  margin: 0 0 8px;
+  font-size: 13px;
+  color: var(--text-muted);
+}
+
+.hm-meta {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px 14px;
+  margin-bottom: 14px;
+  font-size: 12px;
+  color: var(--text-dim);
+}
+
+.hm-meta-file {
+  font-family: var(--font-mono);
+  color: var(--text-muted);
+}
+
+.hm-view-switch {
+  display: inline-flex;
+  margin-left: auto;
+  border: 1px solid var(--border);
+  border-radius: 7px;
+  overflow: hidden;
+}
+
+.hm-view-switch button {
+  height: 26px;
+  padding: 0 10px;
+  border: none;
+  background: none;
+  color: var(--text-muted);
+  font-size: 12px;
+  cursor: pointer;
+}
+
+.hm-view-switch button.is-active {
+  background: var(--bg-selected);
+  color: var(--text);
+}
+
+.hm-entries {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.hm-entry {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  padding: 12px 14px;
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  background: var(--bg-panel);
+}
+
+.hm-entry-head {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 4px 8px;
+  font-size: 12px;
+}
+
+.hm-entry-main {
+  display: flex;
+  gap: 12px;
+}
+
+.hm-entry-index {
+  flex-shrink: 0;
+  min-width: 20px;
+  font-size: 12px;
+  line-height: 1.7;
+  color: var(--text-dim);
+  font-variant-numeric: tabular-nums;
+}
+
+.hm-entry-head .hm-entry-index {
+  min-width: 0;
+  line-height: 20px;
+}
+
+.hm-entry-label {
+  padding: 0 8px;
+  border-radius: 10px;
+  background: color-mix(in srgb, var(--accent) 12%, transparent);
+  color: var(--accent);
+  font-weight: 500;
+  line-height: 20px;
+}
+
+.hm-entry-dates {
+  margin-left: auto;
+  color: var(--text-dim);
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+}
+
+.hm-entry-body {
+  flex: 1;
+  min-width: 0;
+  font-size: 14px;
+}
+
+.hm-raw {
+  margin: 0;
+  padding: 14px;
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  background: var(--bg-panel);
+  font-family: var(--font-mono);
+  font-size: 12.5px;
+  line-height: 1.6;
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+
+.hm-notice {
+  padding: 14px;
+  border: 1px dashed var(--border);
+  border-radius: 10px;
+  color: var(--text-muted);
+  font-size: 13px;
+  line-height: 1.6;
+}
+
+.hm-notice.is-error {
+  border-style: solid;
+  border-color: color-mix(in srgb, #ef4444 40%, var(--border));
+  color: #ef4444;
+  margin-bottom: 12px;
+}
+
+.hm-footer {
+  margin-top: 18px;
+  font-size: 11px;
+  color: var(--text-dim);
+  text-align: center;
+}
+
+@media (max-width: 640px) {
+  .hm-header {
+    padding-left: 10px;
+    padding-right: 10px;
+  }
+
+  .hm-body {
+    padding-left: 10px;
+    padding-right: 10px;
+  }
+
+  .hm-entry {
+    padding: 10px 12px;
+    gap: 6px;
+  }
+
+  .hm-entry-main {
+    gap: 8px;
+  }
+
+  .hm-view-switch {
+    margin-left: 0;
+  }
+}
