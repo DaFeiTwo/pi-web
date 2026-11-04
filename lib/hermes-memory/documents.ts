@@ -50,6 +50,44 @@ export function splitMemoryEntries(content: string): string[] {
     .filter(Boolean);
 }
 
+export interface MemoryEntry {
+  /** The entry's text without its metadata comments or label. */
+  body: string;
+  /** A short leading category such as `环境事实` in `环境事实：…`. */
+  label?: string;
+  /** `created=` from the entry's `<!-- created=…, last=… -->` comment. */
+  created?: string;
+  /** `last=` from the same comment. */
+  last?: string;
+}
+
+const METADATA_COMMENT = /<!--([\s\S]*?)-->/g;
+const METADATA_FIELD = /(\w+)\s*=\s*([^,\s]+)/g;
+// A category is a short word right before a colon, never a URL scheme (`https://`).
+const LEADING_LABEL = /^([^\s：:#*`[\]]{1,12})[：:](?!\/\/)\s*/;
+
+/**
+ * One memory entry as the viewer shows it. pi-hermes-memory ends each entry
+ * with `<!-- created=YYYY-MM-DD, last=YYYY-MM-DD -->`; Markdown drops the
+ * comment, so its dates are read here, and the comment is taken out of the body.
+ */
+export function parseMemoryEntry(entry: string): MemoryEntry {
+  const fields: Record<string, string> = {};
+  const withoutComments = entry.replace(METADATA_COMMENT, (_match, inner: string) => {
+    for (const [, key, value] of inner.matchAll(METADATA_FIELD)) fields[key] = value;
+    return "";
+  }).trim();
+  const labelMatch = LEADING_LABEL.exec(withoutComments);
+  const label = labelMatch?.[1];
+  const body = labelMatch ? withoutComments.slice(labelMatch[0].length) : withoutComments;
+  return {
+    body: body.trim(),
+    ...(label ? { label } : {}),
+    ...(fields.created ? { created: fields.created } : {}),
+    ...(fields.last ? { last: fields.last } : {}),
+  };
+}
+
 /**
  * Memory text is written by a model from conversations, so an image in it
  * must not make the browser fetch a remote address. Markdown images become

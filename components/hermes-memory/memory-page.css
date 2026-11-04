@@ -180,11 +180,25 @@
 
 .hm-entry {
   display: flex;
-  gap: 12px;
+  flex-direction: column;
+  gap: 8px;
   padding: 12px 14px;
   border: 1px solid var(--border);
   border-radius: 10px;
   background: var(--bg-panel);
+}
+
+.hm-entry-head {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 4px 8px;
+  font-size: 12px;
+}
+
+.hm-entry-main {
+  display: flex;
+  gap: 12px;
 }
 
 .hm-entry-index {
@@ -194,7 +208,27 @@
   line-height: 1.7;
   color: var(--text-dim);
   font-variant-numeric: tabular-nums;
-  text-align: right;
+}
+
+.hm-entry-head .hm-entry-index {
+  min-width: 0;
+  line-height: 20px;
+}
+
+.hm-entry-label {
+  padding: 0 8px;
+  border-radius: 10px;
+  background: color-mix(in srgb, var(--accent) 12%, transparent);
+  color: var(--accent);
+  font-weight: 500;
+  line-height: 20px;
+}
+
+.hm-entry-dates {
+  margin-left: auto;
+  color: var(--text-dim);
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
 }
 
 .hm-entry-body {
@@ -252,6 +286,10 @@
 
   .hm-entry {
     padding: 10px 12px;
+    gap: 6px;
+  }
+
+  .hm-entry-main {
     gap: 8px;
   }
 

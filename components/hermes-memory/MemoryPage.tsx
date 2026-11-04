@@ -8,6 +8,7 @@ import { useI18n } from "@/hooks/useI18n";
 import {
   HERMES_MEMORY_DOCUMENTS,
   neutralizeMemoryMedia,
+  parseMemoryEntry,
   splitMemoryEntries,
   type HermesMemoryDocument,
   type HermesMemoryDocumentId,
@@ -192,12 +193,31 @@ function DocumentView({
   else if (view === "raw") body = <pre className="hm-raw">{doc.content}</pre>;
   else body = (
     <ol className="hm-entries">
-      {entries.map((entry, index) => (
-        <li key={index} className="hm-entry">
-          <span className="hm-entry-index" aria-hidden="true">{index + 1}</span>
-          <MarkdownBody className="hm-entry-body">{neutralizeMemoryMedia(entry)}</MarkdownBody>
-        </li>
-      ))}
+      {entries.map((raw, index) => {
+        const entry = parseMemoryEntry(raw);
+        const dates = entry.created && entry.last
+          ? (entry.created === entry.last ? entry.created : text("entryDates", { created: entry.created, last: entry.last }))
+          : entry.created ? text("entryCreated", { date: entry.created })
+            : entry.last ? text("entryLast", { date: entry.last }) : null;
+        const datesTitle = entry.created || entry.last
+          ? [entry.created && text("entryCreated", { date: entry.created }), entry.last && text("entryLast", { date: entry.last })].filter(Boolean).join(" · ")
+          : undefined;
+        return (
+          <li key={index} className="hm-entry">
+            {(entry.label || dates) && (
+              <div className="hm-entry-head">
+                <span className="hm-entry-index">#{index + 1}</span>
+                {entry.label && <span className="hm-entry-label">{entry.label}</span>}
+                {dates && <span className="hm-entry-dates" title={datesTitle}>{dates}</span>}
+              </div>
+            )}
+            <div className="hm-entry-main">
+              {!(entry.label || dates) && <span className="hm-entry-index" aria-hidden="true">{index + 1}</span>}
+              <MarkdownBody className="hm-entry-body">{neutralizeMemoryMedia(entry.body)}</MarkdownBody>
+            </div>
+          </li>
+        );
+      })}
     </ol>
   );
 
