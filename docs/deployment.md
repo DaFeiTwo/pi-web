@@ -5,7 +5,15 @@
 | 分支 | 职责 | 特点 |
 | --- | --- | --- |
 | `main` | 跟随上游 fork 仓库的代码（同步上游更新） | 保持与上游一致，不放部署相关改动 |
-| `deploy` | 部署分支：通过阿里云 ACR 在线构建镜像，再推到服务器上用 Docker 运行 | 在 `main` 基础上叠加 Docker/ACR 部署所需的文件和改动 |
+| `deploy` | 部署分支：通过阿里云 ACR 在线构建镜像，再推到服务器上用 Docker 运行 | `main` + 部署改动 + 自己开发的功能；通过 merge 吸收 `main` 的更新，从不强推 |
+| `feat/*` 等 | 自己的功能开发分支 | 从 `deploy` 拉出，开发完提 PR 合回 `deploy` |
+
+```
+upstream/main ──Sync fork──▶ main（纯镜像，不改）
+                               │ git merge main（普通 push）
+                               ▼
+feat/xxx ──PR──────────────▶ deploy ──push 触发──▶ ACR 构建 ──▶ ECS
+```
 
 - `origin` = fork 仓库：`https://github.com/DaFeiTwo/pi-web.git`
 - 上游父仓库（`main` 的更新来源）：`https://github.com/agegr/pi-web`（据 `package.json` 的 homepage 推断）
@@ -35,42 +43,68 @@
 
 ---
 
-## 2. `deploy`：在 `main` 之上叠加部署改动
+## 2. `deploy`：`main` + 部署改动 + 自己的功能
 
-`deploy` = 最新 `main` + 下面这几类部署专属改动：
+`deploy` = 最新 `main` + 下面这些只属于本 fork 的改动：
 
-- `Dockerfile`、`.dockerignore`、`docker-compose.yml` —— 容器构建与运行配置（`main` 里不存在这些文件）
-- ACR 镜像地址（写在 `docker-compose.yml` 里）
-- 少量部署相关的小改动（如 sidebar 的 GitHub 源码链接）
+- `Dockerfile`、`.dockerignore` —— 我们自己的容器构建配置。上游现在也有这两个文件，但内容不同（上游用 `HOME=/home/node`、`node` 用户、剪掉 dev 依赖），**`deploy` 上始终保留我们的版本**，否则线上 `/data` 卷里的会话、凭据、模型配置会读不到。
+- `docker-compose.yml` —— 仓库里这份只是参考；**服务器上实际用的是另一份**，和仓库里的不同。上游的 `compose.yaml`（按源码构建）也会随 `main` 进入 `deploy`，服务器上用不到它。
+- 自己开发的功能（如新会话页 "Pi Web" 旁的 GitHub 源码链接），通过 PR 合入。
 
-### 用 rebase 让 deploy 追上 main（推荐流程）
+### 用 merge 让 deploy 吸收 main 的更新
 
-因为这是**只有一人使用**的项目，`deploy` 可以放心 rebase + 强推，保持线性历史、部署改动始终叠在 `main` 顶部。
+`deploy` **不再 rebase、不再强推**。原因：rebase 会改写已合并 PR 的提交，开着的 PR 也会对不上基线。merge 只需处理这一次新出现的冲突，普通 push 即可。
 
 ```bash
 # 0) 先确保 main 已同步到最新（见上一节）
 
-# 1) 打个备份分支，出问题能一键回退
-git branch -f deploy-backup-before-rebase deploy
-
-# 2) 切到 deploy，把部署提交重放到最新 main 之上
+# 1) 更新本地 deploy
 git checkout deploy
-git rebase main
-#   如有冲突：解决后 git add <文件> && git rebase --continue
-#   要放弃：git rebase --abort
+git pull
 
-# 3) 本地验证（可选但建议）
-git merge-base --is-ancestor main deploy; echo $?   # 输出 0 表示 main 已完整包含在 deploy 中
-git log --oneline main..deploy                        # 应只剩几个部署提交，无多余 merge
+# 2) 把 main 合进来
+git merge main
+#   如有冲突：解决后 git add <文件> && git commit
+#   要放弃：git merge --abort
+#   冲突规则：Dockerfile / .dockerignore 保留我们的版本（git checkout --ours <文件>）；
+#   其他文件以上游为主，把我们的改动融进去。
 
-# 4) 强推（--force-with-lease 更安全：远端被别人动过会拒绝）
-git push --force-with-lease origin deploy
+# 3) 本地验证（建议）
+node_modules/.bin/tsc --noEmit        # package.json 依赖有变化时先 npm ci
+git log --oneline main..deploy --no-merges   # 只列出我们自己的提交
 
-# 5) 确认无误后可删备份
-git branch -D deploy-backup-before-rebase
+# 4) 普通 push（会触发 ACR 构建）
+git push origin deploy
 ```
 
-> 提示：rebase 会改写 `deploy` 历史。若在别处也 checkout 过 `deploy`，需要 `git fetch && git reset --hard origin/deploy` 重新同步。单人使用无此顾虑。
+查看本 fork 相对上游改了什么：
+
+```bash
+git diff main...deploy                    # 全部差异
+git log --oneline main..deploy --no-merges   # 自己的提交
+```
+
+> 可选：`git config rerere.enabled true` 让 git 记住解决过的冲突，同样的冲突再次出现时自动套用。
+
+### 开发自己的功能
+
+```bash
+git checkout deploy && git pull
+git checkout -b feat/xxx
+# ... 开发、提交 ...
+git push -u origin feat/xxx
+# GitHub 上开 PR：feat/xxx → deploy（合并方式建议选 Squash），合并后自动触发部署
+```
+
+- `feat/xxx` 开发期间想跟上 `deploy` 最新代码，在它上面 rebase 或 merge 都可以（它是自己的分支）。
+- 合并后删掉 `feat/xxx`，下次开发重新从 `deploy` 拉。
+
+减少同步冲突的做法（比选 rebase 还是 merge 影响更大）：
+
+1. 新功能尽量写在新文件里，上游常改的文件（`ChatWindow.tsx`、`SessionSidebar.tsx`、`globals.css`）里只留一两行引用。
+2. 能用 pi 扩展或 skill 实现的，就别改 pi-web 源码，扩展放在 `~/.pi` 下，不会冲突。
+3. 通用改进提 PR 给上游 `agegr/pi-web`，被接受后就不用自己维护。
+4. 配置项尽量走环境变量（如上游已支持的 `PI_WEB_APP_NAME`），别写死在代码里。
 
 ---
 
@@ -99,10 +133,18 @@ ACR **已绑定 `deploy` 分支**：只要 `deploy` 有新 push，ACR 就会自�
 ### 在服务器（阿里云 ECS）上运行
 
 ```bash
-# 拉最新镜像并后台启动
+# 拉最新镜像并后台启动（镜像变了会自动用新镜像重建容器）
 docker compose pull
 docker compose up -d
+
+# 检查
+docker compose ps
+docker compose logs -f
 ```
+
+- 不要用 `docker compose restart` 来更新：它只重启现有容器，仍是旧镜像。
+- `pull` 报 `unauthorized` / `denied` 时，先 `docker login crpi-eiqk1i70nlck3uul.cn-beijing.personal.cr.aliyuncs.com`。
+- 旧镜像会变成 `<none>` 留在本地，确认新版正常后再 `docker image prune` 清理，在此之前可用它回退。
 
 `docker-compose.yml` 关键点：
 
@@ -136,10 +178,11 @@ docker compose up -d
 git checkout main && git pull
 #   或命令行：git fetch upstream && git merge --ff-only upstream/main && git push origin main
 
-# ② deploy rebase 到最新 main 并强推
-git branch -f deploy-backup-before-rebase deploy
-git checkout deploy && git rebase main
-git push --force-with-lease origin deploy
+# ② main 合进 deploy 并普通 push（冲突规则见第 2 节）
+git checkout deploy && git pull
+git merge main
+node_modules/.bin/tsc --noEmit
+git push origin deploy
 
 # ③ ACR 检测到 deploy push 后【自动】构建镜像并推到 :latest（无需手动操作，等构建完成）
 
