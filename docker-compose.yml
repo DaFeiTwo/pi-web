@@ -1,17 +1,16 @@
-# Deploy on your Aliyun ECS. Pull the image built by ACR, then `docker compose up -d`.
+# Deploy on your server. Values are read from a local .env file that is not committed.
 services:
   pi-web:
-    image: crpi-eiqk1i70nlck3uul.cn-beijing.personal.cr.aliyuncs.com/stock_analysis/pi-web:latest
+    image: ${PI_WEB_IMAGE:?Set PI_WEB_IMAGE in .env}
     container_name: pi-web
     restart: unless-stopped
     ports:
       - "30141:30141"
     environment:
       # REQUIRED when exposed to the internet. Username is always "pi".
-      PI_WEB_PASSWORD: "change-me-to-a-long-random-secret"
-      # If you access through a domain / reverse proxy, list the exact hostname(s)
-      # here, comma-separated. Accessing by raw IP does NOT need this.
-      # PI_WEB_ALLOWED_HOSTS: "pi.example.com"
+      PI_WEB_PASSWORD: ${PI_WEB_PASSWORD:?Set PI_WEB_PASSWORD in .env}
+      # REQUIRED for access through a domain or reverse proxy.
+      PI_WEB_ALLOWED_HOSTS: ${PI_WEB_ALLOWED_HOSTS:?Set PI_WEB_ALLOWED_HOSTS in .env}
     volumes:
       # Persists pi state: ~/.pi (sessions/auth/models), ~/.agents (skills),
       # and any ~/pi-cwd-* working directories. HOME is /data inside the image.

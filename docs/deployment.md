@@ -112,11 +112,13 @@ git push -u origin feat/xxx
 
 ### 镜像
 
-- ACR 镜像地址：
-  ```
-  crpi-eiqk1i70nlck3uul.cn-beijing.personal.cr.aliyuncs.com/stock_analysis/pi-web:latest
-  ```
-- 命名空间：`stock_analysis`，镜像名：`pi-web`，tag：`latest`
+真实 ACR 地址不提交到仓库，只放在服务器的 `.env`：
+
+```dotenv
+PI_WEB_IMAGE=<your-registry-host>/<namespace>/pi-web:latest
+```
+
+`docker-compose.yml` 通过 `${PI_WEB_IMAGE}` 读取完整镜像地址；密码和代理域名也分别通过 `${PI_WEB_PASSWORD}`、`${PI_WEB_ALLOWED_HOSTS}` 读取。三个变量为空时 Compose 会拒绝启动。
 
 ### 构建（阿里云 ACR 自动构建）
 
@@ -143,7 +145,7 @@ docker compose logs -f
 ```
 
 - 不要用 `docker compose restart` 来更新：它只重启现有容器，仍是旧镜像。
-- `pull` 报 `unauthorized` / `denied` 时，先 `docker login crpi-eiqk1i70nlck3uul.cn-beijing.personal.cr.aliyuncs.com`。
+- `pull` 报 `unauthorized` / `denied` 时，先执行 `docker login <your-registry-host>`，registry host 与服务器 `.env` 中 `PI_WEB_IMAGE` 的主机部分一致。
 - 旧镜像会变成 `<none>` 留在本地，确认新版正常后再 `docker image prune` 清理，在此之前可用它回退。
 
 `docker-compose.yml` 关键点：
@@ -156,7 +158,7 @@ docker compose logs -f
 - **`PI_WEB_PASSWORD`（必须设）** —— 开启 HTTP Basic Auth。
   - 逻辑在 `proxy.ts`：设了之后访问整个 Web UI 需要登录，**用户名固定是 `pi`**，密码就是这个值。
   - **不设 = 任何能访问到域名的人都能直接操作你的 agent**（agent 能在 ECS 上读写文件、执行命令），公网暴露绝不能留空。
-  - compose 里当前是占位符 `change-me-to-a-long-random-secret`，部署前改成一段长随机串。
+  - 密码由服务器 `.env` 中的 `PI_WEB_PASSWORD` 提供，Compose 会拒绝空值。不要把真实密码提交到仓库。
   - 它是明文 Basic Auth，**务必让 nginx 终止 HTTPS**，否则密码等于明文过网络。
 
 - **`PI_WEB_ALLOWED_HOSTS`（走 nginx/域名代理必须设）** —— 逗号分隔的精确域名白名单（`lib/request-security.ts` 读取）。
