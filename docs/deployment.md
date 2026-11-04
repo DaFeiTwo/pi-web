@@ -126,11 +126,11 @@ ACR **已绑定 `deploy` 分支**：只要 `deploy` 有新 push，ACR 就会自�
 
 `Dockerfile` 采用两阶段构建（`node:22-bookworm-slim`）：
 
-- **build 阶段**：`npm ci` 装全量依赖（`next build` 需要 devDependencies），然后 `npm run build`。
-- **runtime 阶段**：装 `git` + `ca-certificates`（in-process agent 会 shell out 调 git、走 HTTPS 调 LLM），拷贝运行 `next start` 所需产物。
-- **重要**：**不能** `npm prune --omit=dev`。`next start` 运行时用 `jiti` 解析 `next.config.ts`，`jiti` 是 devDependency，剪掉会导致启动报 `Cannot find module 'jiti'`。
+- **build 阶段**：`npm ci --ignore-scripts` 按 lockfile 安装依赖且不执行 lifecycle scripts；随后执行 `npm run build`，删除构建缓存和 source map，再通过 `npm prune --omit=dev` 移除 devDependencies。当前 `jiti` 由生产依赖 `@earendil-works/pi-coding-agent` 提供，裁剪后仍会保留。
+- **runtime 阶段**：安装 `bash`、`git` 和 `ca-certificates`，用于 Agent Shell、终端、Git 操作和 HTTPS 请求；镜像带有 HTTP 健康检查。
+- **数据兼容**：继续使用 `HOME=/data` 和 `VOLUME /data`，确保服务器现有数据卷中的会话、凭据、模型配置和工作目录保持原路径。当前仍以容器 root 用户运行，避免已有 `/data` 文件的权限迁移；这不等同于 ECS 宿主机 root。
 
-镜像默认：端口 `30141`，`PI_WEB_HOSTNAME=0.0.0.0`，`HOME=/data`（pi 的状态都写在 `$HOME` 下）。
+镜像默认：端口 `30141`，`PI_WEB_HOSTNAME=0.0.0.0`，`HOME=/data`。
 
 ### 在服务器（阿里云 ECS）上运行
 
