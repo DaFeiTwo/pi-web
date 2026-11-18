@@ -53,14 +53,16 @@ feat/xxx ──PR──────────────▶ deploy ──push
 
 ### 用 merge 让 deploy 吸收 main 的更新
 
-`deploy` **不再 rebase、不再强推**。原因：rebase 会改写已合并 PR 的提交，开着的 PR 也会对不上基线。merge 只需处理这一次新出现的冲突，普通 push 即可。
+`deploy` **不再 rebase、不再强推**。原因：rebase 会改写已合并 PR 的提交，开着的 PR 也会对不上基线。merge 只需处理这一次新出现的冲突。
+
+同步也走 PR：在同步分支上 merge `main`，推送后开 PR 到 `deploy`，让 CI（lint、类型检查、单元测试、生产构建、e2e）先跑一遍，通过后再合并触发部署。
 
 ```bash
 # 0) 先确保 main 已同步到最新（见上一节）
 
-# 1) 更新本地 deploy
-git checkout deploy
-git pull
+# 1) 从最新 deploy 拉同步分支
+git checkout deploy && git pull
+git checkout -b sync/upstream-<版本号>
 
 # 2) 把 main 合进来
 git merge main
@@ -69,13 +71,20 @@ git merge main
 #   冲突规则：Dockerfile / .dockerignore 保留我们的版本（git checkout --ours <文件>）；
 #   其他文件以上游为主，把我们的改动融进去。
 
-# 3) 本地验证（建议）
-node_modules/.bin/tsc --noEmit        # package.json 依赖有变化时先 npm ci
-git log --oneline main..deploy --no-merges   # 只列出我们自己的提交
+# 3) 本地验证
+npm ci                                 # package.json 依赖有变化时
+node_modules/.bin/tsc --noEmit
+git log --oneline main..HEAD --no-merges   # 只列出我们自己的提交
 
-# 4) 普通 push（会触发 ACR 构建）
-git push origin deploy
+# 4) 推送同步分支并开 PR（不会触发部署）
+git push -u origin sync/upstream-<版本号>
+gh pr create --repo DaFeiTwo/pi-web --base deploy --head sync/upstream-<版本号> --fill
+
+# 5) CI 通过后合并（会触发 ACR 构建）
+gh pr merge <PR号> --repo DaFeiTwo/pi-web --merge --delete-branch
 ```
+
+> **同步 PR 必须用 merge commit 合并（GitHub 上选 "Create a merge commit"），不能选 Squash。** Squash 会把上游的提交压成一个新提交，Git 不再知道这些 `main` 提交已经进了 `deploy`，下次同步时同样的冲突会再出现一次。功能 PR 用 Squash 没问题。
 
 查看本 fork 相对上游改了什么：
 
@@ -180,11 +189,13 @@ docker compose logs -f
 git checkout main && git pull
 #   或命令行：git fetch upstream && git merge --ff-only upstream/main && git push origin main
 
-# ② main 合进 deploy 并普通 push（冲突规则见第 2 节）
-git checkout deploy && git pull
+# ② 在同步分支上 merge main，开 PR 到 deploy，CI 通过后用 merge commit 合并（详见第 2 节）
+git checkout deploy && git pull && git checkout -b sync/upstream-<版本号>
 git merge main
-node_modules/.bin/tsc --noEmit
-git push origin deploy
+npm ci && node_modules/.bin/tsc --noEmit
+git push -u origin sync/upstream-<版本号>
+gh pr create --repo DaFeiTwo/pi-web --base deploy --fill
+gh pr merge <PR号> --repo DaFeiTwo/pi-web --merge --delete-branch   # 不要用 --squash
 
 # ③ ACR 检测到 deploy push 后【自动】构建镜像并推到 :latest（无需手动操作，等构建完成）
 
