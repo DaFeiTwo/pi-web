@@ -1,3 +1,4 @@
+import { isRecord } from "./is-record";
 const EFFORT_LEVELS = ["minimal", "low", "medium", "high", "xhigh", "max"] as const;
 type EffortLevel = typeof EFFORT_LEVELS[number];
 
@@ -23,14 +24,12 @@ const CONTEXT_WINDOW_FIELDS = [
 const MAX_TOKENS_FIELDS = ["max_output_tokens", "maxOutputTokens", "max_completion_tokens", "outputTokenLimit"];
 const REASONING_FIELDS = ["supports_reasoning", "supportsReasoning", "reasoning", "thinking"];
 // Every spelling of the effort list; the first one that is an array wins.
+// `effort.supported_levels` nests it beside the gateway's default level (#1791).
 const EFFORT_LIST_FIELDS = ["supported_efforts", "supportedEfforts", "reasoning_levels"];
+const EFFORT_OBJECT_LIST_FIELDS = ["supported_levels", "supportedLevels"];
 
 // pi's models.json accepts `text` and `image`; a gateway may advertise more.
 const INPUT_MODALITIES = new Set(["text", "image"]);
-
-function isRecord(value: unknown): value is Record<string, unknown> {
-  return typeof value === "object" && value !== null && !Array.isArray(value);
-}
 
 function cleanString(value: unknown): string | undefined {
   return typeof value === "string" && value.trim() ? value.trim() : undefined;
@@ -46,16 +45,25 @@ function firstPositiveInteger(value: Record<string, unknown>, fields: readonly s
 }
 
 /**
- * `modalities.input` (models.dev and pi's own metadata) or a bare `input` array
- * names what the model takes. Only the modalities pi knows survive; a list
- * naming none of them says nothing, and `["image"]` is kept as advertised —
- * guessing `text` back in would override what the gateway said.
+ * `modalities.input` (models.dev and pi's own metadata), `input_modalities`
+ * (bare, or under OpenRouter's `architecture`) or a bare `input` array names
+ * what the model takes. Only the modalities pi knows survive; a list naming
+ * none of them says nothing, and `["image"]` is kept as advertised — guessing
+ * `text` back in would override what the gateway said.
  */
+function inputListFromValue(value: Record<string, unknown>): unknown[] | undefined {
+  const { modalities, architecture } = value;
+  const candidates = [
+    isRecord(modalities) ? modalities.input : undefined,
+    value.input_modalities,
+    isRecord(architecture) ? architecture.input_modalities : undefined,
+    value.input,
+  ];
+  return candidates.find(Array.isArray);
+}
+
 function inputFromValue(value: Record<string, unknown>): string[] | undefined {
-  const modalities = value.modalities;
-  const list = isRecord(modalities) && Array.isArray(modalities.input)
-    ? modalities.input
-    : Array.isArray(value.input) ? value.input : undefined;
+  const list = inputListFromValue(value);
   if (!list) return undefined;
   const input = Array.from(new Set(list
     .filter((entry): entry is string => typeof entry === "string")
@@ -73,7 +81,11 @@ function inputFromValue(value: Record<string, unknown>): string[] | undefined {
  * A list naming none of pi's levels maps nothing.
  */
 function thinkingLevelMapFromEfforts(value: Record<string, unknown>): DiscoveredModel["thinkingLevelMap"] {
-  const list = EFFORT_LIST_FIELDS.map((field) => value[field]).find(Array.isArray);
+  const effort = value.effort;
+  const list = [
+    ...EFFORT_LIST_FIELDS.map((field) => value[field]),
+    ...(isRecord(effort) ? EFFORT_OBJECT_LIST_FIELDS.map((field) => effort[field]) : []),
+  ].find(Array.isArray);
   if (!list) return undefined;
   const advertised = new Set(list.filter((effort): effort is string => typeof effort === "string"));
   if (!EFFORT_LEVELS.some((level) => advertised.has(level))) return undefined;
@@ -143,6 +155,11 @@ export function parseDiscoveredModels(value: unknown): DiscoveredModel[] {
   }));
 }
 
+// A Google base URL's own API version (`/v1`, `/v1beta`, `/v1alpha`, `/v1beta1`):
+// pi sends Google requests under the base URL as given (apiVersion ""), so the
+// model list is there too. Anthropic's SDK adds `/v1` to its base URL itself.
+const GOOGLE_API_VERSION_SEGMENT = /\/v\d+(?:(?:alpha|beta)\d*)?$/i;
+
 export function buildModelsListUrl(baseUrl: string, api: string): URL {
   const url = new URL(baseUrl.trim());
   const trimmedPath = url.pathname.replace(/\/+$/, "");
@@ -150,7 +167,7 @@ export function buildModelsListUrl(baseUrl: string, api: string): URL {
   if (!/\/models$/i.test(trimmedPath)) {
     let path = trimmedPath;
     if (api === "anthropic-messages" && !/\/v\d+(?:beta)?$/i.test(path)) path += "/v1";
-    if (api === "google-generative-ai" && !/\/v\d+(?:beta)?$/i.test(path)) path += "/v1beta";
+    if (api === "google-generative-ai" && !GOOGLE_API_VERSION_SEGMENT.test(path)) path += "/v1beta";
     url.pathname = `${path}/models`.replace(/\/+/g, "/");
   }
 

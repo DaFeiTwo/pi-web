@@ -15,6 +15,7 @@ export interface BashResultLike {
   cancelled?: boolean;
   truncated?: boolean;
   fullOutputPath?: string;
+  fullOutputError?: string;
 }
 
 export interface ContextUsage {
@@ -170,14 +171,23 @@ export interface AgentSessionLike {
    */
   readonly systemPrompt: string;
   readonly agent: {
+    readonly toolExecution: "parallel" | "sequential";
     state?: {
       /** Replayed from the transcript's system messages since Pi 0.86; never assign it. */
       readonly systemPrompt?: string;
       thinkingLevel?: string;
       streamingMessage?: PiAgentMessage;
       /** The declared tools, with the descriptions `prepareLoadout` hooks set for the model. */
-      readonly tools?: readonly { readonly name: string; readonly description: string }[];
+      readonly tools?: readonly { readonly name: string; readonly description: string; readonly executionMode?: "parallel" | "sequential" }[];
     };
+    /** How many queued steers a turn takes; the SDK reads it from settings at creation and reload. */
+    steeringMode?: "all" | "one-at-a-time";
+    /** How many queued follow-ups a turn takes, read like `steeringMode`. */
+    followUpMode?: "all" | "one-at-a-time";
+    /** Steers and follow-ups pi has queued, its custom messages included (`getSteeringMessages()` lists texts only). */
+    hasQueuedMessages(): boolean;
+    /** The current run's abort signal; Stop aborts it. */
+    readonly signal?: AbortSignal;
   };
   readonly extensionRunner: ExtensionRunnerLike;
   readonly promptTemplates: readonly PromptTemplateLike[];
@@ -204,6 +214,7 @@ export interface AgentSessionLike {
     deliverAs?: "steer" | "followUp" | "nextTurn";
   }): Promise<void>;
   abort(): Promise<void>;
+  waitForIdle(): Promise<void>;
   executeBash(command: string, onChunk?: (chunk: string) => void, options?: {
     excludeFromContext?: boolean;
     operations?: BashOperations;

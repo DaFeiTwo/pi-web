@@ -1,3 +1,4 @@
+import { isRecord } from "./is-record";
 // Display helpers for pi's `codemode` tool, whose calls carry a JavaScript
 // script and whose results list the tool calls the script made. The shapes
 // mirror the SDK's `CodemodeToolDetails` / `CodemodeNestedCall`, read
@@ -26,10 +27,6 @@ export interface CodemodeCalls {
 }
 
 const STATUSES = new Set<string>(["running", "ok", "error", "cancelled"]);
-
-function isRecord(value: unknown): value is Record<string, unknown> {
-  return typeof value === "object" && value !== null && !Array.isArray(value);
-}
 
 function finiteNumber(value: unknown): number | undefined {
   return typeof value === "number" && Number.isFinite(value) ? value : undefined;
@@ -123,8 +120,13 @@ export function getCodemodeProgress(partialResult: unknown): string | null {
   const { calls } = codemodeCalls(partialResult.details);
   const call = calls.findLast((candidate) => candidate.status === "running") ?? calls.at(-1);
   if (!call) return null;
-  const args = call.args.length > PROGRESS_ARGS_LENGTH
-    ? `${call.args.slice(0, PROGRESS_ARGS_LENGTH - 3)}...`
-    : call.args;
+  let args = call.args;
+  if (args.length > PROGRESS_ARGS_LENGTH) {
+    let end = PROGRESS_ARGS_LENGTH - 3;
+    // Do not cut a surrogate pair in half.
+    const last = args.charCodeAt(end - 1);
+    if (last >= 0xd800 && last <= 0xdbff) end--;
+    args = `${args.slice(0, end)}...`;
+  }
   return args ? `${call.name} ${args}` : call.name;
 }

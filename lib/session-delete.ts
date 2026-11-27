@@ -13,8 +13,9 @@
  * each would read every file of the folder once per session.
  */
 
-import { readdirSync, readFileSync, unlinkSync, writeFileSync } from "fs";
+import { readdirSync, readFileSync, unlinkSync } from "fs";
 import { dirname, join } from "path";
+import { writeSessionFileAtomicSync } from "./atomic-file";
 import { abortSubagent, getRpcSession, getRpcSessionInfos, getRunningRpcSessionIds } from "./rpc-manager";
 import {
   invalidateSessionListCache,
@@ -30,6 +31,7 @@ import { forgetSessionUiState } from "./session-ui-state";
 import { readSubagentRun, SUBAGENT_META_TYPE } from "./subagents";
 import { readSideRelation } from "./side-session";
 import type { SessionEntry } from "./types";
+import { errorMessage } from "./errors";
 
 /** Most ids one POST /api/sessions/delete takes; the sidebar sends a bigger project in parts. */
 export const MAX_SESSION_DELETE_IDS = 500;
@@ -228,7 +230,8 @@ export async function deleteSessions(
                 break;
               }
             }
-            writeFileSync(childPath, lines.join("\n"));
+            // Atomic: a process killed mid-write must not leave the child truncated.
+            writeSessionFileAtomicSync(childPath, lines.join("\n"));
           } catch { /* skip malformed */ }
         }
       } catch { /* skip if dir unreadable */ }
@@ -252,7 +255,7 @@ export async function deleteSessions(
   try {
     await forgetSessionUiState(deletedSessionIds);
   } catch (error) {
-    console.warn(`[pi-web] could not clear the sidebar state of deleted sessions: ${error instanceof Error ? error.message : String(error)}`);
+    console.warn(`[pi-web] could not clear the sidebar state of deleted sessions: ${errorMessage(error)}`);
   }
   invalidateSessionListCache();
   return { deleted: [...deletedSessionIds], missing, running };

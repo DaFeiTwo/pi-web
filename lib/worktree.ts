@@ -1,9 +1,12 @@
 import { execFile } from "child_process";
-import { existsSync, mkdirSync, readFileSync, realpathSync } from "fs";
+import { existsSync, mkdirSync, readFileSync, realpath, realpathSync } from "fs";
+import { access } from "fs/promises";
 import { basename, dirname, join, resolve } from "path";
 import { promisify } from "util";
 import { allowFileRoot } from "./allowed-roots";
+import { projectGitEnvironment } from "./git-environment";
 import { samePath, toNativePath } from "./paths";
+import { errorMessage } from "./errors";
 
 const execFileAsync = promisify(execFile);
 
@@ -37,7 +40,7 @@ export interface WorktreeInfo {
 
 declare global {
   var __piProjectCache: Map<string, { info: ProjectInfo; expiresAt: number }> | undefined;
-  var __piProjectRefresh: Map<string, Promise<void>> | undefined;
+  var __piProjectRefresh: Map<string, Promise<ProjectInfo>> | undefined;
   var __piProjectCacheGeneration: number | undefined;
 }
 
@@ -60,7 +63,7 @@ async function git(cwd: string, args: string[], timeoutMs = 10_000): Promise<str
     maxBuffer: 1024 * 1024,
     // Pin the message locale so error-text matching (e.g. the dirty-worktree
     // detection in the DELETE route) works regardless of system language.
-    env: { ...process.env, LC_ALL: "C" },
+    env: projectGitEnvironment(),
   });
   return stdout.trim();
 }
@@ -98,16 +101,70 @@ function realPathOrSelf(filePath: string): string {
  * (`parent/repo.git`) is its own root: its parent may hold other repositories,
  * whose worktrees would otherwise all land in one project.
  */
-function repoRootFromCommonDir(commonDir: string): string {
+async function repoRootFromCommonDir(commonDir: string): Promise<string> {
   const parent = dirname(commonDir);
   if (basename(commonDir) === ".git") return parent;
+  // A submodule's git dir (`.git/modules/<name>`) is kept apart from its checkout
+  // and names it as `core.worktree`, relative to itself. Only a checkout whose
+  // `.git` file points back counts: a git dir's config alone never moves the root.
+  const candidates = [parent];
   try {
-    const match = /^gitdir:\s*(.+?)\s*$/m.exec(readFileSync(join(parent, ".git"), "utf8"));
-    if (match && samePath(realPathOrSelf(resolve(parent, match[1])), realPathOrSelf(commonDir))) return parent;
+    const configured = await git(commonDir, ["config", "--file", join(commonDir, "config"), "--get", "core.worktree"]);
+    if (configured) candidates.unshift(resolve(commonDir, configured));
   } catch {
-    // No `.git` file beside it (a `.git` directory belongs to another repo).
+    // Not set (a bare clone), or unreadable.
+  }
+  for (const candidate of candidates) {
+    try {
+      const match = /^gitdir:\s*(.+?)\s*$/m.exec(readFileSync(join(candidate, ".git"), "utf8"));
+      if (match && samePath(realPathOrSelf(resolve(candidate, match[1])), realPathOrSelf(commonDir))) return candidate;
+    } catch {
+      // No `.git` file there (a `.git` directory belongs to another repo).
+    }
   }
   return commonDir;
+}
+
+const projectFallback = (cwd: string): ProjectInfo => ({
+  projectRoot: cwd, branch: null, isWorktree: false, isTopLevel: false,
+});
+
+function pathExists(filePath: string): Promise<boolean> {
+  return access(filePath).then(() => true, () => false);
+}
+
+const realpathAsync = promisify(realpath);
+
+// Node's JS realpath, as `realpathSync`: `fs/promises.realpath` is the OS one, which on macOS
+// rewrites a cwd's letter case and on Windows resolves `subst` drives, so a project would
+// group differently from the sync path.
+function realPathOrSelfAsync(filePath: string): Promise<string> {
+  return realpathAsync(filePath).catch(() => filePath);
+}
+
+const inferredRepoChecks = new Map<string, Promise<string | null>>();
+
+function checkInferredRepo(repoRoot: string): Promise<string | null> {
+  const current = inferredRepoChecks.get(repoRoot);
+  if (current) return current;
+  const task = (async () => {
+    const isRepo = await pathExists(join(repoRoot, ".git"))
+      || (await Promise.all(["HEAD", "objects", "refs"].map((name) => pathExists(join(repoRoot, name))))).every(Boolean);
+    return isRepo ? realPathOrSelfAsync(repoRoot) : null;
+  })().finally(() => inferredRepoChecks.delete(repoRoot));
+  inferredRepoChecks.set(repoRoot, task);
+  return task;
+}
+
+async function inferRemovedWorktreeAsync(cwd: string): Promise<ProjectInfo | null> {
+  const repoRoot = removedWorktreeRepo(cwd);
+  const projectRoot = repoRoot && await checkInferredRepo(repoRoot);
+  return projectRoot ? { projectRoot, branch: basename(cwd), isWorktree: true, isTopLevel: true } : null;
+}
+
+function removedWorktreeRepo(cwd: string): string | null {
+  const parent = dirname(cwd);
+  return parent.endsWith("-worktrees") ? parent.slice(0, -"-worktrees".length) || null : null;
 }
 
 /**
@@ -121,12 +178,11 @@ function repoRootFromCommonDir(commonDir: string): string {
  * deletes the directory *and* its admin entry, so nothing survives to ask. It names one
  * folder and nothing else — the parent of the cwd with a `-worktrees` suffix stripped.
  * `/api/models`, which answers *for* such a cwd, takes the repo as just another cwd and
- * re-checks it against the allowed roots itself.
+ * re-checks it against the allowed roots itself. `resolveProject()` asks the same
+ * question without blocking (`inferRemovedWorktreeAsync()`).
  */
 export function inferRemovedWorktree(cwd: string): ProjectInfo | null {
-  const parent = dirname(cwd);
-  if (!parent.endsWith("-worktrees")) return null;
-  const repoRoot = parent.slice(0, -"-worktrees".length);
+  const repoRoot = removedWorktreeRepo(cwd);
   if (!repoRoot) return null;
   // A bare clone has no `.git`; git takes HEAD, objects/ and refs/ for a git dir.
   const isRepo = existsSync(join(repoRoot, ".git"))
@@ -142,7 +198,7 @@ export function inferRemovedWorktree(cwd: string): ProjectInfo | null {
  * that the stale value is still returned immediately while a background
  * refresh re-runs git; callers (chiefly the session list, which fans out over
  * every project cwd) therefore never wait on git subprocesses once a cwd has
- * been resolved once. Concurrent refreshes for the same cwd share one promise.
+ * been resolved once. Concurrent lookups for the same cwd, cold or stale, share one promise.
  * add/removeWorktree invalidate eagerly via invalidateProjectCache().
  *
  * Transient git failures are the exception: the caller gets a cwd-only
@@ -155,49 +211,45 @@ export async function resolveProject(cwd: string): Promise<ProjectInfo> {
   const now = Date.now();
   if (cached && cached.expiresAt > now) return cached.info;
 
-  // Serve the stale entry now; refresh out of band.
+  const task = refreshProject(cwd);
   if (cached) {
-    refreshProjectInBackground(cwd);
+    void task.catch(() => undefined);
     return cached.info;
   }
 
-  let info: ProjectInfo;
   try {
-    info = await resolveProjectUncached(cwd);
+    return await task;
   } catch (error) {
-    // Transient git failure (fd exhaustion, a killed git): serve a cwd-only
-    // fallback for this request only, never cached, so it cannot become a
-    // lasting project identity. The next request retries.
-    console.error(`[pi-web] resolveProject: git failed for ${cwd}, not cached: ${error instanceof Error ? error.message : String(error)}`);
-    return { projectRoot: cwd, branch: null, isWorktree: false, isTopLevel: false };
+    // A transient failure must not pin a phantom project identity.
+    console.error(`[pi-web] resolveProject: git failed for ${cwd}, not cached: ${errorMessage(error)}`);
+    return projectFallback(cwd);
   }
-  cache.set(cwd, { info, expiresAt: Date.now() + PROJECT_CACHE_TTL_MS });
-  return info;
 }
 
-function refreshProjectInBackground(cwd: string): void {
-  const inflight = (globalThis.__piProjectRefresh ??= new Map<string, Promise<void>>());
-  if (inflight.has(cwd)) return;
+function refreshProject(cwd: string): Promise<ProjectInfo> {
+  const inflight = (globalThis.__piProjectRefresh ??= new Map<string, Promise<ProjectInfo>>());
+  const current = inflight.get(cwd);
+  if (current) return current;
   const generation = globalThis.__piProjectCacheGeneration ?? 0;
   const task = resolveProjectUncached(cwd)
     .then((info) => {
-      if ((globalThis.__piProjectCacheGeneration ?? 0) !== generation) return;
-      getProjectCache().set(cwd, { info, expiresAt: Date.now() + PROJECT_CACHE_TTL_MS });
-    })
-    .catch(() => {
-      // Keep the stale entry on refresh failure; the next TTL window retries.
+      if ((globalThis.__piProjectCacheGeneration ?? 0) === generation) {
+        getProjectCache().set(cwd, { info, expiresAt: Date.now() + PROJECT_CACHE_TTL_MS });
+      }
+      return info;
     })
     .finally(() => {
       if (inflight.get(cwd) === task) inflight.delete(cwd);
     });
   inflight.set(cwd, task);
+  return task;
 }
 
 async function resolveProjectUncached(cwd: string): Promise<ProjectInfo> {
   let info: ProjectInfo;
   try {
-    if (!existsSync(cwd)) {
-      return inferRemovedWorktree(cwd) ?? { projectRoot: cwd, branch: null, isWorktree: false, isTopLevel: false };
+    if (!await pathExists(cwd)) {
+      return (await inferRemovedWorktreeAsync(cwd)) ?? projectFallback(cwd);
     }
     const out = await git(cwd, [
       "rev-parse", "--path-format=absolute",
@@ -209,7 +261,7 @@ async function resolveProjectUncached(cwd: string): Promise<ProjectInfo> {
     // keep its forward slashes (`feature/foo`).
     const [commonDir, gitDir, toplevel] = [commonDirRaw, gitDirRaw, toplevelRaw].map(toNativePath);
     // git prints resolved (symlink-free) paths; normalize cwd the same way
-    const realCwd = realPathOrSelf(cwd);
+    const realCwd = await realPathOrSelfAsync(cwd);
     // For a linked worktree, --git-dir differs from --git-common-dir.
     // Only collapse *worktree toplevels* into the main repo. A session whose
     // cwd is a subdirectory of a repo keeps its own project identity —
@@ -219,9 +271,9 @@ async function resolveProjectUncached(cwd: string): Promise<ProjectInfo> {
     // worktree switcher.
     const isTopLevel = samePath(toplevel, realCwd);
     const isWorktreeTopLevel = !samePath(gitDir, commonDir) && isTopLevel;
-    const topLevelProjectRoot = isWorktreeTopLevel ? repoRootFromCommonDir(commonDir) : toplevel;
+    const topLevelProjectRoot = isWorktreeTopLevel ? await repoRootFromCommonDir(commonDir) : toplevel;
     info = {
-      projectRoot: isTopLevel ? realPathOrSelf(topLevelProjectRoot) : cwd,
+      projectRoot: isTopLevel ? await realPathOrSelfAsync(topLevelProjectRoot) : cwd,
       branch: ref && ref !== "HEAD" ? ref : null,
       isWorktree: isWorktreeTopLevel,
       isTopLevel,
@@ -230,7 +282,7 @@ async function resolveProjectUncached(cwd: string): Promise<ProjectInfo> {
     // A transient failure propagates so resolveProject keeps it out of the
     // cache; whatever git itself answered is this folder's identity for now.
     if (isTransientGitError(error)) throw error;
-    info = { projectRoot: cwd, branch: null, isWorktree: false, isTopLevel: false };
+    info = projectFallback(cwd);
   }
 
   return info;
@@ -247,7 +299,7 @@ async function resolveProjectUncached(cwd: string): Promise<ProjectInfo> {
 /** Main repo root (parent of the shared .git dir, or a bare clone), or throws for non-git dirs */
 async function getRepoRoot(cwd: string): Promise<string> {
   const commonDir = await git(cwd, ["rev-parse", "--path-format=absolute", "--git-common-dir"]);
-  return realPathOrSelf(repoRootFromCommonDir(toNativePath(commonDir)));
+  return realPathOrSelf(await repoRootFromCommonDir(toNativePath(commonDir)));
 }
 
 /** Every worktree git has registered, `missing` when it is prunable or its folder is gone. */
@@ -255,6 +307,7 @@ async function listRegisteredWorktrees(cwd: string): Promise<{ path: string; bra
   const out = await git(cwd, ["worktree", "list", "--porcelain"]);
   const worktrees: { path: string; branch: string | null; missing: boolean }[] = [];
   let current: { path: string; branch?: string; prunable?: boolean } | null = null;
+  let mainIsBare = false;
 
   const flush = () => {
     if (current?.path) {
@@ -271,6 +324,8 @@ async function listRegisteredWorktrees(cwd: string): Promise<{ path: string; bra
     if (line.startsWith("worktree ")) {
       flush();
       current = { path: toNativePath(line.slice("worktree ".length).trim()) };
+    } else if (line.trim() === "bare" && current && worktrees.length === 0) {
+      mainIsBare = true;
     } else if (line.startsWith("branch ") && current) {
       current.branch = line.slice("branch ".length).trim().replace(/^refs\/heads\//, "");
     } else if (line.startsWith("prunable") && current) {
@@ -280,6 +335,16 @@ async function listRegisteredWorktrees(cwd: string): Promise<{ path: string; bra
     }
   }
   flush();
+  // For a submodule, git names its git dir in .git/modules as the main worktree,
+  // not the checkout that holds the files. A checkout holds a `.git`: no git run.
+  const [main] = worktrees;
+  if (main && !mainIsBare && !existsSync(join(main.path, ".git"))) {
+    const commonDir = toNativePath(await git(cwd, ["rev-parse", "--path-format=absolute", "--git-common-dir"]));
+    if (samePath(main.path, commonDir)) {
+      const checkout = await repoRootFromCommonDir(commonDir);
+      if (!samePath(checkout, commonDir)) Object.assign(main, { path: checkout, missing: !existsSync(checkout) });
+    }
+  }
   return worktrees;
 }
 
@@ -409,5 +474,5 @@ export function worktreeHasUncommittedFiles(message: string): boolean {
 function extractGitError(error: unknown): string {
   const stderr = (error as { stderr?: string }).stderr;
   if (typeof stderr === "string" && stderr.trim()) return stderr.trim();
-  return error instanceof Error ? error.message : String(error);
+  return errorMessage(error);
 }
