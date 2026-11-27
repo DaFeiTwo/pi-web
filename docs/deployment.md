@@ -133,6 +133,25 @@ PI_WEB_IMAGE=<your-registry-host>/<namespace>/pi-web:latest
 
 ACR **已绑定 `deploy` 分支**：只要 `deploy` 有新 push，ACR 就会自动用 `Dockerfile` 在线构建镜像并推到上面的仓库地址，**tag 固定为 `latest`**。也就是说发布不需要手动点构建，`git push` 到 deploy 之后等 ACR 构建完成即可。
 
+#### 推送后没有触发构建
+
+自动构建靠 GitHub 仓库里的一个 webhook：每次 push，GitHub 都会通知阿里云的回调地址 `cr-callback.console.aliyun.com`。这个回调偶尔会超时（10 秒没响应），GitHub 只发一次，失败就放弃，于是 ACR 收不到这次推送，构建日志里也没有新记录。代码已经推上去了，分支也没推错。
+
+合并 PR 时 GitHub 往往连发两条通知：一条是删除 PR 分支，另一条是 `deploy` 更新。真正触发构建的是 `deploy` 那条，要确认它成功了。
+
+处理方法，任选一种：
+
+1. **在 ACR 手动构建**（最简单）：ACR 控制台 → 镜像仓库 `pi-web` → 构建 → `branches:deploy` 那一行点「立即构建」。它会拉 `deploy` 最新代码，效果和自动构建一样。
+2. **在 GitHub 重发通知**：仓库 Settings → Webhooks → 阿里云那个 webhook → Recent Deliveries，找到失败（红色）且 `ref` 是 `refs/heads/deploy` 的那条，点 Redeliver。
+3. **用 gh 命令重发**：
+   ```powershell
+   gh api repos/DaFeiTwo/pi-web/hooks                                  # 找到 webhook 的 id
+   gh api "repos/DaFeiTwo/pi-web/hooks/<hook-id>/deliveries?per_page=5" # 找到失败的 delivery id（status_code 为 500）
+   gh api -X POST "repos/DaFeiTwo/pi-web/hooks/<hook-id>/deliveries/<delivery-id>/attempts"
+   ```
+
+重发或手动构建后，刷新 ACR 构建日志，应能看到一条新的 `latest` 构建。
+
 `Dockerfile` 采用两阶段构建（`node:22-bookworm-slim`）：
 
 - **build 阶段**：`npm ci --ignore-scripts` 按 lockfile 安装依赖且不执行 lifecycle scripts；随后执行 `npm run build`，删除构建缓存和 source map，再通过 `npm prune --omit=dev` 移除 devDependencies。当前 `jiti` 由生产依赖 `@earendil-works/pi-coding-agent` 提供，裁剪后仍会保留。
@@ -157,10 +176,10 @@ docker compose logs -f
 - `pull` 报 `unauthorized` / `denied` 时，先执行 `docker login <your-registry-host>`，registry host 与服务器 `.env` 中 `PI_WEB_IMAGE` 的主机部分一致。
 - 旧镜像会变成 `<none>` 留在本地，确认新版正常后再 `docker image prune` 清理，在此之前可用它回退。
 
-`docker-compose.yml` 关键点：
+`docker-compose.yml` 关键点（仓库里这份是参考，服务器上的 compose 以实际配置为准）：
 
 - 端口映射 `30141:30141`（nginx 反向代理到这个端口）
-- 数据卷 `pi-web-data:/data` 持久化 pi 状态：`~/.pi`（sessions/auth/models）、`~/.agents`（skills）、`~/pi-cwd-*` 工作目录
+- 容器内的 `/data` 必须持久化（仓库示例用命名卷，也可以挂载宿主目录），里面是 pi 的状态：`~/.pi`（sessions/auth/models）、`~/.agents`（skills）、`~/pi-cwd-*` 工作目录
 
 #### 环境变量：鉴权与域名（本项目走 nginx 域名代理，两个都必须配）
 
@@ -198,6 +217,7 @@ gh pr create --repo DaFeiTwo/pi-web --base deploy --fill
 gh pr merge <PR号> --repo DaFeiTwo/pi-web --merge --delete-branch   # 不要用 --squash
 
 # ③ ACR 检测到 deploy push 后【自动】构建镜像并推到 :latest（无需手动操作，等构建完成）
+#    构建日志里没有新记录：webhook 通知可能超时，见第 3 节「推送后没有触发构建」
 
 # ④ ECS 上拉新镜像并重启
 docker compose pull && docker compose up -d
