@@ -3,6 +3,7 @@
 import { useEffect, useImperativeHandle, useLayoutEffect, useState, useCallback, useMemo, useRef, type CSSProperties, type KeyboardEvent as ReactKeyboardEvent, type MouseEvent as ReactMouseEvent, type ReactNode, type Ref, type RefObject, type UIEvent as ReactUIEvent } from "react";
 import type { SessionInfo } from "@/lib/types";
 import { listSessionFamilies, type SessionFamily, isHiddenRelation } from "@/lib/session-family";
+import { clearDraft } from "@/lib/draft-store";
 import { dispatchSessionRowContextMenu } from "@/lib/session-row-context-menu";
 import { newSessionDeepLink, sessionDeepLink } from "@/lib/session-links";
 import { getProjectActivity, getRecentProjects } from "@/lib/project-groups";
@@ -26,6 +27,10 @@ import {
   PINNED_MORE_KEY,
   showLessFamilies,
   showMoreFamilies,
+  startOfLocalDay,
+  type RecentListInput,
+  type RecentSection,
+  type SidebarListMode,
   type SidebarProject,
   type SidebarRow,
 } from "@/lib/session-tree";
@@ -34,15 +39,19 @@ import {
   loadArchiveCollapsed,
   loadFilesCollapsed,
   loadGroupExpansion,
+  loadListMode,
   loadNonGitCwds,
   loadPinnedCollapsed,
+  loadRecentCollapsed,
   loadShowIgnoredFiles,
   loadSidebarTab,
   rememberCwdGitStatus,
   saveArchiveCollapsed,
   saveFilesCollapsed,
   saveGroupExpansion,
+  saveListMode,
   savePinnedCollapsed,
+  saveRecentCollapsed,
   saveShowIgnoredFiles,
   saveSidebarTab,
   type SidebarTab,
@@ -113,6 +122,7 @@ import {
   ChangesIcon,
   CheckIcon,
   ChevronIcon,
+  ClockIcon,
   DotIcon,
   DotOutlineIcon,
   EyeIcon,
@@ -132,6 +142,7 @@ import {
   TrashIcon,
   UploadIcon,
 } from "./SidebarIcons";
+import { errorMessage } from "@/lib/errors";
 
 interface FileManagerAvailability {
   supported: boolean;
@@ -217,6 +228,8 @@ export interface SelectSessionOptions {
 interface Props {
   selectedSessionId: string | null;
   onSelectSession: (session: SessionInfo, isRestore?: boolean, entryId?: string, blockIndex?: number, options?: SelectSessionOptions) => void;
+  /** The row menu's "Insert into chat": the session joins the open composer as a chip. */
+  onInsertSessionReference?: (session: SessionInfo) => void;
   /** A side chat's search hit: its parent opens, then the side chat's tab. */
   onSelectSideChat: (session: SessionInfo) => void;
   /** projectKey: the target's project identity when it is known (a group's "+", the composer's bar). */
@@ -278,6 +291,9 @@ export interface SessionSidebarControl {
   refreshWorktrees(): void;
   /** Creates a worktree of `project` and lists it at once; the caller starts the session in it. */
   createWorktree(project: ProjectChoice, branch: string): Promise<{ path: string } | { error: string }>;
+  /** Opens a listed session as picking it from the list does (a side chat as
+   *  its parent's tab, as a search hit opens it); false when it is not listed. */
+  openSession(sessionId: string): boolean;
 }
 
 type WorktreeEntry = WorktreeChoice;
@@ -327,6 +343,8 @@ type ArchiveDeleteScope = "all" | "old";
 const LAST_CUSTOM_CWD_STORAGE_KEY = "pi-web:last-custom-cwd";
 const RUNNING_SESSIONS_POLL_MS = 2500;
 const SESSION_DETAILS_HYDRATION_DELAY_MS = 750;
+// How long the running poll leaves an unknown list version to the first summary (a cold disk).
+const INITIAL_SUMMARY_WAIT_MS = 15_000;
 /** "Archive sessions older than 7 days" in a project's menu. */
 const ARCHIVE_OLDER_THAN_MS = 7 * 24 * 60 * 60 * 1000;
 /** The archive bar's "Delete archived over 30 days ago", by archive time. */
@@ -351,6 +369,7 @@ const SIDEBAR_HEADER_HEIGHT = 36;
 
 const SESSION_ACTION_LABEL_KEYS: Record<SessionMenuActionId, string> = {
   "open-new-tab": "sidebar.openInNewTab",
+  "insert-into-chat": "sidebar.insertIntoChat",
   pin: "sidebar.pin",
   unpin: "sidebar.unpin",
   rename: "sidebar.rename",
@@ -365,6 +384,7 @@ const SESSION_ACTION_LABEL_KEYS: Record<SessionMenuActionId, string> = {
 function sessionActionIcon(id: SessionMenuActionId): ReactNode {
   switch (id) {
     case "open-new-tab": return <OpenInNewTabIcon />;
+    case "insert-into-chat": return <MessageIcon />;
     case "pin": return <PinIcon />;
     case "unpin": return <PinOffIcon />;
     case "rename": return <PencilIcon />;
@@ -509,13 +529,42 @@ function useHeaderFit(ref: RefObject<HTMLElement | null>, labels: string): () =>
   return fit;
 }
 
+/**
+ * The start of the viewer's local day (lib/session-tree.ts
+ * startOfLocalDay()), moved on just after local midnight, and again when the
+ * page is shown: a sleeping laptop's timer may fire late or not at all.
+ */
+function useLocalDayStart(): number {
+  const [day, setDay] = useState(() => startOfLocalDay(Date.now()));
+  useEffect(() => {
+    let timer: number | undefined;
+    const update = () => {
+      const now = Date.now();
+      const start = startOfLocalDay(now);
+      setDay(start);
+      const tomorrow = new Date(start);
+      tomorrow.setDate(tomorrow.getDate() + 1);
+      window.clearTimeout(timer);
+      timer = window.setTimeout(update, tomorrow.getTime() - now + 1000);
+    };
+    update();
+    const onVisible = () => { if (document.visibilityState === "visible") update(); };
+    document.addEventListener("visibilitychange", onVisible);
+    return () => {
+      window.clearTimeout(timer);
+      document.removeEventListener("visibilitychange", onVisible);
+    };
+  }, []);
+  return day;
+}
+
 /** A menu placed below (or above) a button, lined up with one of its edges. */
 function buttonAnchor(element: HTMLElement, align: "start" | "end"): SidebarMenuAnchor {
   const rect = element.getBoundingClientRect();
   return { kind: "rect", rect: { left: rect.left, top: rect.top, right: rect.right, bottom: rect.bottom }, align };
 }
 
-export function SessionSidebar({ selectedSessionId, onSelectSession, onSelectSideChat, onNewSession, controlRef, onNewSessionContextChange, initialSessionId, initialSessionLinked, skipInitialProjectSelection, onInitialRestoreDone, refreshKey, onSessionDeleted, selectedCwd: selectedCwdProp, onCwdChange, onOpenFile, onOpenTerminal, explorerRefreshKey, onExplorerRefresh, onAtMention, onAtMentions, onBackgroundTaskDone, hiddenFinishedSessionIds, onRunningSessionIdsChange, onSessionsChange }: Props) {
+export function SessionSidebar({ selectedSessionId, onSelectSession, onSelectSideChat, onNewSession, controlRef, onNewSessionContextChange, initialSessionId, initialSessionLinked, skipInitialProjectSelection, onInitialRestoreDone, refreshKey, onSessionDeleted, selectedCwd: selectedCwdProp, onCwdChange, onOpenFile, onOpenTerminal, explorerRefreshKey, onExplorerRefresh, onAtMention, onAtMentions, onInsertSessionReference, onBackgroundTaskDone, hiddenFinishedSessionIds, onRunningSessionIdsChange, onSessionsChange }: Props) {
   const { t } = useI18n();
   const isMobile = useIsMobile();
   const [allSessions, setAllSessions] = useState<SessionInfo[]>([]);
@@ -523,6 +572,11 @@ export function SessionSidebar({ selectedSessionId, onSelectSession, onSelectSid
   // decide whether the list needs reloading, and no render reads it.
   const sessionListVersionRef = useRef<number | null>(null);
   const sessionLoadIdRef = useRef(0);
+  // While the first summary list is in flight, the running poll must not take the
+  // unknown list version for an invalidation and supersede it with a full scan.
+  // Bounded: a summary request that stalls (a dropped phone connection) must not
+  // keep the poll from loading the list forever.
+  const initialSummaryStartedAtRef = useRef<number | null>(null);
   const [loading, setLoading] = useState(true);
   // The first paint lists summary rows (their time is the file's mtime); the
   // project order is first saved from the full details.
@@ -614,6 +668,10 @@ export function SessionSidebar({ selectedSessionId, onSelectSession, onSelectSid
   const [keptOpenGroups, setKeptOpenGroups] = useState<ReadonlySet<string>>(() => new Set());
   const [moreShown, setMoreShown] = useState<Readonly<Record<string, number>>>({});
   const [pinnedCollapsed, setPinnedCollapsed] = useState(false);
+  // The list by project (groups) or by date across projects, and the date
+  // sections folded there; both per browser.
+  const [listMode, setListMode] = useState<SidebarListMode>("projects");
+  const [recentCollapsed, setRecentCollapsed] = useState<readonly RecentSection[]>([]);
   // True once the mount effect below has put the browser's folds back: set
   // in the same batch, so a render that has it has them too.
   const [sidebarPrefsRestored, setSidebarPrefsRestored] = useState(false);
@@ -831,6 +889,9 @@ export function SessionSidebar({ selectedSessionId, onSelectSession, onSelectSid
     const groups = loadGroupExpansion();
     if (Object.keys(groups).length > 0) setGroupExpansion(groups);
     if (loadPinnedCollapsed()) setPinnedCollapsed(true);
+    if (loadListMode() === "recent") setListMode("recent");
+    const recentFolds = loadRecentCollapsed();
+    if (recentFolds.length > 0) setRecentCollapsed(recentFolds);
     const archiveFolds = loadArchiveCollapsed();
     if (archiveFolds.length > 0) setArchiveCollapsed(archiveFolds);
     if (loadFilesCollapsed()) setFilesCollapsed(true);
@@ -839,7 +900,9 @@ export function SessionSidebar({ selectedSessionId, onSelectSession, onSelectSid
     forgetRetiredSidebarKeys();
   }, []);
 
-  const loadSessions = useCallback(async (showLoading = false, force = false, summary = false) => {
+  // `alongside` runs in the same render as the new list, when it lands: the
+  // running poll's answer, so the two never show one state each.
+  const loadSessions = useCallback(async (showLoading = false, force = false, summary = false, alongside?: () => void): Promise<boolean> => {
     const loadId = ++sessionLoadIdRef.current;
     try {
       if (showLoading) setLoading(true);
@@ -854,10 +917,14 @@ export function SessionSidebar({ selectedSessionId, onSelectSession, onSelectSid
         awaitingInputSessionIds?: string[];
         completionNotificationSuppressedSessionIds?: string[];
       };
-      if (loadId !== sessionLoadIdRef.current) return;
+      if (loadId !== sessionLoadIdRef.current) return false;
       sessionListVersionRef.current = data.sessionListVersion;
       setAllSessions(data.sessions);
-      if (!summary) setSessionDetailsLoaded(true);
+      alongside?.();
+      // A summary row whose file changed since the last scan is the only one
+      // without its details; the others were checked against their file's stat.
+      const needsDetails = data.sessions.some((session) => session.detailsPending === true);
+      if (!summary || !needsDetails) setSessionDetailsLoaded(true);
       // Treat the fetched running set as an initial fallback only. Once the
       // lightweight poll is live, a slow session-list fetch cannot overwrite it.
       if (!runningPollAuthoritativeRef.current) {
@@ -882,8 +949,10 @@ export function SessionSidebar({ selectedSessionId, onSelectSession, onSelectSid
         return next.size === prev.size ? prev : next;
       });
       setError(null);
+      return needsDetails;
     } catch (e) {
       if (loadId === sessionLoadIdRef.current) setError(String(e));
+      return false;
     } finally {
       if (loadId === sessionLoadIdRef.current) setLoading(false);
     }
@@ -898,9 +967,12 @@ export function SessionSidebar({ selectedSessionId, onSelectSession, onSelectSid
     if (isFirst) {
       // Header/stat metadata is enough to select the URL session and paint the
       // sidebar. Hydrate exact counts, names, and first messages once the
-      // selected chat has had a chance to start loading.
-      void loadSessions(true, false, true).then(() => {
-        if (!active) return;
+      // selected chat has had a chance to start loading, and only when the
+      // summary has rows a full scan still owes.
+      initialSummaryStartedAtRef.current = Date.now();
+      void loadSessions(true, false, true).then((needsDetails) => {
+        initialSummaryStartedAtRef.current = null;
+        if (!active || !needsDetails) return;
         detailsHydrationTimerRef.current = setTimeout(() => {
           detailsHydrationTimerRef.current = null;
           if (active) void loadSessions(false, true);
@@ -957,7 +1029,7 @@ export function SessionSidebar({ selectedSessionId, onSelectSession, onSelectSid
       const data = await res.json().catch(() => ({})) as { error?: string };
       setFileManagerError(data.error ?? `HTTP ${res.status}`);
     } catch (error) {
-      setFileManagerError(error instanceof Error ? error.message : String(error));
+      setFileManagerError(errorMessage(error));
     }
     return true;
   }, [selectedCwd, selectedCwdProp]);
@@ -1048,15 +1120,30 @@ export function SessionSidebar({ selectedSessionId, onSelectSession, onSelectSid
         currentSuppressedCompletionSessionIdsRef.current = new Set(
           data.completionNotificationSuppressedSessionIds ?? [],
         );
-        setRunningSessionIds((previous) => sameIdsOr(previous, data.runningSessionIds ?? []));
-        setAwaitingInputSessionIds((previous) => sameIdsOr(previous, data.awaitingInputSessionIds ?? []));
-        setSubagentsActiveSessionIds((previous) => sameIdsOr(previous, data.subagentsActiveSessionIds ?? []));
+        // The answer's running sets, applied with the session list of the same
+        // moment: a run's end comes with a new list version (agent_end), and
+        // shown before that list, the session would be idle with the times
+        // of before its run.
+        let applied = false;
+        const applyRunning = () => {
+          if (applied || stopped || controller !== current) return;
+          applied = true;
+          setRunningSessionIds((previous) => sameIdsOr(previous, data.runningSessionIds ?? []));
+          setAwaitingInputSessionIds((previous) => sameIdsOr(previous, data.awaitingInputSessionIds ?? []));
+          setSubagentsActiveSessionIds((previous) => sameIdsOr(previous, data.subagentsActiveSessionIds ?? []));
+        };
         // Pins and archive changed in another window: reload them.
         noteUiRevision(data.sessionUiStateRevision);
-        if (data.sessionListVersion !== sessionListVersionRef.current) {
+        // The first summary may still be in flight (a cold disk): its version is
+        // unknown, not stale, so a full scan must not supersede it.
+        const summaryStartedAt = initialSummaryStartedAtRef.current;
+        const summaryInFlight = summaryStartedAt !== null && Date.now() - summaryStartedAt < INITIAL_SUMMARY_WAIT_MS;
+        if (!summaryInFlight && data.sessionListVersion !== sessionListVersionRef.current) {
           // Reuse the invalidated cache; forcing a scan would change the version again.
-          await loadSessions();
+          await loadSessions(false, false, false, applyRunning);
         }
+        // No list to wait for, or its load failed or was overtaken.
+        applyRunning();
       } catch {
         // Keep the last known state; the next visible-tab poll retries.
         outcome = current.signal.aborted ? "aborted" : "error";
@@ -1366,7 +1453,7 @@ export function SessionSidebar({ selectedSessionId, onSelectSession, onSelectSid
       });
       setSelectedCwd(data.cwd);
     } catch (e) {
-      setCustomPathError(e instanceof Error ? e.message : String(e));
+      setCustomPathError(errorMessage(e));
     } finally {
       setCustomPathValidating(false);
     }
@@ -1416,7 +1503,7 @@ export function SessionSidebar({ selectedSessionId, onSelectSession, onSelectSid
       setWtRefreshKey((k) => k + 1);
       return { path };
     } catch (e) {
-      return { error: e instanceof Error ? e.message : String(e) };
+      return { error: errorMessage(e) };
     }
   }, [t]);
 
@@ -1438,7 +1525,7 @@ export function SessionSidebar({ selectedSessionId, onSelectSession, onSelectSid
       setWtRefreshKey((k) => k + 1);
       return "removed";
     } catch (e) {
-      return { error: e instanceof Error ? e.message : String(e) };
+      return { error: errorMessage(e) };
     }
   }, [currentWorktreePath]);
 
@@ -1476,8 +1563,18 @@ export function SessionSidebar({ selectedSessionId, onSelectSession, onSelectSid
   const startNewSessionInRef = useRef(startNewSessionIn);
   startNewSessionInRef.current = startNewSessionIn;
 
+  const openSessionRef = useRef<(sessionId: string) => boolean>(() => false);
+  openSessionRef.current = (sessionId) => {
+    const session = allSessions.find((item) => item.id === sessionId);
+    if (!session) return false;
+    if (session.relation?.kind === "side" && session.id !== selectedSessionId) onSelectSideChat(session);
+    else handleSelectSessionFromList(session);
+    return true;
+  };
+
   useImperativeHandle(controlRef, () => ({
     startNewSessionIn: (target) => startNewSessionInRef.current(target),
+    openSession: (sessionId) => openSessionRef.current(sessionId),
     openFolderForNewSession: (onPicked, returnFocusTo) => {
       folderPickRef.current = onPicked;
       folderReturnFocusRef.current = returnFocusTo;
@@ -1575,6 +1672,12 @@ export function SessionSidebar({ selectedSessionId, onSelectSession, onSelectSid
     () => effectiveGroupExpansion(groupExpansion, keptOpenGroups),
     [groupExpansion, keptOpenGroups],
   );
+  // The recent list: the viewer's day and the folded date sections.
+  const today = useLocalDayStart();
+  const recentList = useMemo<RecentListInput>(
+    () => ({ today, collapsed: new Set(recentCollapsed) }),
+    [today, recentCollapsed],
+  );
   const model = useMemo(() => buildSessionTree({
     sessions: allSessions,
     uiState,
@@ -1586,7 +1689,9 @@ export function SessionSidebar({ selectedSessionId, onSelectSession, onSelectSid
     groupExpansion: shownGroupExpansion,
     moreShown,
     pinnedCollapsed,
-  }), [allSessions, uiState, runningSessionIds, awaitingInputSessionIds, unreadSessionIds, selectedSessionId, currentProject, shownGroupExpansion, moreShown, pinnedCollapsed]);
+    listMode,
+    recent: recentList,
+  }), [allSessions, uiState, runningSessionIds, awaitingInputSessionIds, unreadSessionIds, selectedSessionId, currentProject, shownGroupExpansion, moreShown, pinnedCollapsed, listMode, recentList]);
   // Built while the archive view is rendered, its way out included: it
   // leaves as it was, not empty.
   const archiveMounted = archiveMotion.archiveMounted;
@@ -1702,11 +1807,11 @@ export function SessionSidebar({ selectedSessionId, onSelectSession, onSelectSid
     [],
   );
 
-  // A family's row where the tree shows it now (pinned, in its group, or in
-  // the open archive view), else the selected tab.
+  // A family's row where the tree shows it now (pinned, in its group, in the
+  // recent list, or in the open archive view), else the selected tab.
   const familyRowButton = useCallback((rootId: string): HTMLElement | null => {
     const panel = sessionsPanelRef.current;
-    for (const context of ["pinned", "group", "archive"]) {
+    for (const context of ["pinned", "group", "recent", "archive"]) {
       const key = CSS.escape(`session:${context}:${rootId}`);
       const button = panel?.querySelector<HTMLElement>(`[data-row-key="${key}"] .session-tree-main`);
       if (button && button.getClientRects().length > 0) return button;
@@ -2036,7 +2141,9 @@ export function SessionSidebar({ selectedSessionId, onSelectSession, onSelectSid
     setConfirmDeleteRootId((current) => (current === session.id ? null : current));
     try {
       // The server deletes the family's subagent sessions with it.
-      await fetch(`/api/sessions/${encodeURIComponent(session.id)}`, { method: "DELETE" });
+      const res = await fetch(`/api/sessions/${encodeURIComponent(session.id)}`, { method: "DELETE" });
+      // Drafts are kept in this browser's storage: they go with their sessions.
+      if (res.ok) [session, ...family.subagents].forEach((member) => clearDraft(member.id));
       onSessionDeleted?.(session.id);
       void loadSessions();
     } catch {
@@ -2096,11 +2203,19 @@ export function SessionSidebar({ selectedSessionId, onSelectSession, onSelectSid
       runningIds: runningSessionIds,
       groupExpansion: shownGroupExpansion,
       pinnedCollapsed,
+      listMode,
+      recent: recentList,
     }, sessionId);
     if (!location) return;
     if (location.unfoldPinned) {
       setPinnedCollapsed(false);
       savePinnedCollapsed(false);
+    }
+    const unfoldRecent = location.unfoldRecent;
+    if (unfoldRecent) {
+      const next = recentCollapsed.filter((section) => section !== unfoldRecent);
+      setRecentCollapsed(next);
+      saveRecentCollapsed(next);
     }
     if (location.unfoldGroup) {
       const next = { ...groupExpansion };
@@ -2117,7 +2232,7 @@ export function SessionSidebar({ selectedSessionId, onSelectSession, onSelectSid
       block: "nearest",
       ...(focus?.sessionId === sessionId ? { takeFocusFrom: focus.takeFocusFrom } : {}),
     });
-  }, [selectedSessionId, allSessions, uiState, runningSessionIds, shownGroupExpansion, groupExpansion, pinnedCollapsed, loading, uiStateLoaded, sidebarPrefsRestored, mainTreeShown, saveGroupChoices]);
+  }, [selectedSessionId, allSessions, uiState, runningSessionIds, shownGroupExpansion, groupExpansion, pinnedCollapsed, listMode, recentList, recentCollapsed, loading, uiStateLoaded, sidebarPrefsRestored, mainTreeShown, saveGroupChoices]);
 
   // Fork (the row menu's F): the server copies the family's current branch
   // into a new session beside it (POST /api/sessions/[id]/fork) and leaves
@@ -2195,7 +2310,7 @@ export function SessionSidebar({ selectedSessionId, onSelectSession, onSelectSid
       openForkedRef.current(forked, row.key);
       showToast(message, [], tail);
     } catch (error) {
-      showToast(t("sidebar.forkFailed", { error: error instanceof Error ? error.message : String(error) }));
+      showToast(t("sidebar.forkFailed", { error: errorMessage(error) }));
     } finally {
       forkingIdsRef.current.delete(source.id);
     }
@@ -2217,6 +2332,7 @@ export function SessionSidebar({ selectedSessionId, onSelectSession, onSelectSid
     const { family } = row;
     switch (id) {
       case "open-new-tab": openFamilyInNewTab(family); break;
+      case "insert-into-chat": onInsertSessionReference?.(family.root); break;
       case "pin": setFamilyPinned(family, true); break;
       case "unpin": setFamilyPinned(family, false); break;
       case "rename": startRename(family); break;
@@ -2310,7 +2426,10 @@ export function SessionSidebar({ selectedSessionId, onSelectSession, onSelectSid
     showToast(t("sidebar.deletingSessions"));
     try {
       const outcome = await deleteProjectSessions(ids, fetch);
-      for (const id of outcome.deleted) onSessionDeleted?.(id);
+      for (const id of outcome.deleted) {
+        clearDraft(id);
+        onSessionDeleted?.(id);
+      }
       // A group goes with its last session (in the tree, unless it is
       // current or pinned): focus that fell to the page with it moves on.
       void loadSessions().then(() => focusAfterCommit(focusTarget));
@@ -2479,6 +2598,31 @@ export function SessionSidebar({ selectedSessionId, onSelectSession, onSelectSid
   const handleShowLess = useCallback((key: string) => {
     setMoreShown((prev) => showLessFamilies(prev, key));
   }, []);
+
+  // The toolbar's Sort by date: the list switches between project groups and
+  // the recent list, and the open session's row is brought into view in the
+  // list it switched to, as when it was opened. Its cell is always there, so
+  // the row's widths never change with the view: on the files tab or over
+  // the archive view it shows the session list, as the recent one (as the
+  // search opens the sessions' where the files have none to offer).
+  const handleToggleListMode = () => {
+    const listInView = (stacked || sidebarTab === "sessions") && !archiveView;
+    const next: SidebarListMode = listInView && listMode === "recent" ? "projects" : "recent";
+    if (!listInView) {
+      switchTab("sessions");
+      if (archiveView) setArchiveView(false);
+    }
+    setListMode(next);
+    saveListMode(next);
+    openRevealRef.current = selectedSessionId;
+  };
+  const handleToggleRecentSection = (section: RecentSection) => {
+    const next = recentCollapsed.includes(section)
+      ? recentCollapsed.filter((item) => item !== section)
+      : [...recentCollapsed, section];
+    setRecentCollapsed(next);
+    saveRecentCollapsed(next);
+  };
 
   const handleTogglePinned = () => {
     const next = !pinnedCollapsed;
@@ -2848,6 +2992,7 @@ export function SessionSidebar({ selectedSessionId, onSelectSession, onSelectSid
     onShowMore: handleShowMore,
     onShowLess: handleShowLess,
     onTogglePinned: handleTogglePinned,
+    onToggleRecentSection: handleToggleRecentSection,
     onArchiveFamily: archiveFamily,
     onRestoreFamily: restoreFamily,
     onOpenRowMenu: openRowMenu,
@@ -2899,6 +3044,9 @@ export function SessionSidebar({ selectedSessionId, onSelectSession, onSelectSid
   // sessions' search alone; the files section's header has the files'.
   const sessionsShown = stacked || sidebarTab === "sessions";
   const searchesFiles = !stacked && sidebarTab === "files" && explorerCwd !== null;
+  // Sort by date is pressed while the recent list is in view: not on the
+  // files tab, nor under the archive view.
+  const listModePressed = listMode === "recent" && sessionsShown && !archiveView;
   // What the toolbar row's widths depend on: New's label, and the tabs (the
   // chosen tab's label is bolder, the files tab carries the count). The
   // brand's text reports its own changes (fitHeader).
@@ -3036,10 +3184,10 @@ export function SessionSidebar({ selectedSessionId, onSelectSession, onSelectSid
       )}
       {/* One toolbar row, in the cells of the chat's top bar beside it (its
           line continues that bar's): Sessions | Files, then New and the
-          search of the tab in view. Only the two tabs are the tablist. With
-          the files below the sessions there is nothing to choose: the brand
-          stands there (the panel's anchor, the versions on a click), and
-          the search is the sessions'. */}
+          search of the tab in view, then Sort by date, always there. Only the two tabs are the tablist. With the files
+          below the sessions there is nothing to choose: the brand stands
+          there (the panel's anchor, the versions on a click), and the
+          search is the sessions'. */}
       <div ref={headerRef} className="sidebar-header">
         {stacked && <PiWebTitle onWidthChange={fitHeader} />}
         {!stacked && (
@@ -3113,6 +3261,16 @@ export function SessionSidebar({ selectedSessionId, onSelectSession, onSelectSid
           className={`sidebar-search-toggle${(searchesFiles ? fileSearchOpen : sessionSearchOpen) ? " is-active" : ""}`}
         >
           <SearchIcon size={16} />
+        </button>
+        <button
+          type="button"
+          className={`sidebar-search-toggle sidebar-list-mode-toggle${listModePressed ? " is-active" : ""}`}
+          aria-pressed={listModePressed}
+          aria-label={t("sidebar.listRecent")}
+          title={t("sidebar.listRecent")}
+          onClick={handleToggleListMode}
+        >
+          <ClockIcon size={15} />
         </button>
       </div>
 

@@ -2,8 +2,7 @@ import type { ThinkingLevel } from "@earendil-works/pi-agent-core";
 import { createAgentSessionFromServices, createAgentSessionServices, getAgentDir, initTheme, SessionManager, SettingsManager, Theme, type ModelRuntime } from "@earendil-works/pi-coding-agent";
 import { KeybindingsManager as TuiKeybindingsManager, TUI_KEYBINDINGS } from "@earendil-works/pi-tui";
 import { randomUUID } from "crypto";
-import { existsSync, realpathSync, writeFileSync } from "fs";
-import { resolve } from "path";
+import { existsSync, statSync, writeFileSync } from "fs";
 import { isDeepStrictEqual } from "util";
 import { validateAgentImages } from "./image-attachments";
 import { EXTENSION_REPORTED_CODE } from "./agent-client";
@@ -21,8 +20,10 @@ import {
   preferUserBashExtension,
   preferUserPowerShellExtension,
 } from "./project-command-env";
-import { cacheSessionPath, catalogFirstMessage, getLatestModelChange, invalidateSessionListCache, invalidateSessionManagerCache, invalidateSessionPathCache, readLatestSessionEntryId, resolveSessionPath } from "./session-reader";
+import { cacheSessionPath, catalogFirstMessage, getLatestModelChange, invalidateSessionListCache, invalidateSessionManagerCache, invalidateSessionPathCache, openSessionManager, readLatestSessionEntryId, resolveSessionPath } from "./session-reader";
+import { expandSessionReferences, resolveSessionReferenceForSend } from "./session-reference";
 import { computeLiveSessionTotalActiveMs } from "./session-timing";
+import { realPathOrResolved } from "./paths";
 import { getProjectTrustStatus, projectTrustReloadOptions } from "./project-trust";
 import { notifySessionComplete } from "./web-push";
 import { hasActiveSessionLivenessProvider } from "./session-liveness";
@@ -49,6 +50,7 @@ import {
   readSubagentRun,
   readSubagentSessionResources,
   settleOrphanedSubagentStatus,
+  configuredPackageRoots,
   subagentExtensionLoaderOptions,
   subagentToolOptions,
   SUBAGENT_CONTROL_TOOL_NAMES,
@@ -70,15 +72,16 @@ import type { DebugMcpHost, DebugSessionLifecycle, DebugWrapperSnapshot } from "
 import { mcpPromptPreparation, type McpCommandCandidate } from "./mcp-command";
 import { createReadOnlyMcpPolicyExtension, createSubagentMcpPolicyExtension } from "./mcp-read-only-policy";
 import { createSubagentSkillsBinding } from "./subagent-skills";
-import { isNestedToolExecutionEvent } from "./agent-event-wire";
+import { isNestedToolExecutionEvent, liveToolExecutionEvent, parallelToolCallIds } from "./agent-event-wire";
 import { collectStartupIssues, extensionErrorMessage, limitStartupNotices, type StartupIssue } from "./startup-issues";
-import { collectLiveAssistantNotices, readShowCacheMissNotices, withSessionPrices } from "./transcript-notices-server";
+import { collectLiveAssistantNotices, readNoticeSettings, shownNotices, withSessionPrices } from "./transcript-notices-server";
 import {
   appendClearedSessionToolSelection,
   appendSessionToolSelection,
   readSessionToolSelection,
   validateSessionToolSelection,
 } from "./session-tool-selection";
+import { isThinkingLevel } from "./thinking-levels";
 
 // ============================================================================
 // Types
@@ -151,6 +154,8 @@ type ActiveCustomUi = {
   resolve: (value: unknown) => void;
   settled: boolean;
 };
+
+const MAX_TIMER_MS = 2 ** 31 - 1;
 
 type ExtensionUiRequestBody = Record<string, unknown> & {
   method: ExtensionUiRequest["method"];
@@ -303,7 +308,6 @@ export interface RpcSessionStartOptions {
 }
 
 const CODING_TOOL_NAMES = ["read", "bash", "powershell", "edit", "write", "grep", "find", "ls"];
-const THINKING_LEVEL_NAMES = new Set<ThinkingLevel>(["off", "minimal", "low", "medium", "high", "xhigh", "max"]);
 // The SDK's DEFAULT_THINKING_LEVEL (dist/core/defaults.js), which it does not export.
 const SDK_DEFAULT_THINKING_LEVEL: ThinkingLevel = "medium";
 
@@ -371,6 +375,8 @@ export class AgentSessionWrapper {
   // next stream miss that same event.
   private listeners = new Set<EventListener>();
   private activeToolEvents = new Map<string, ActiveToolEvents>();
+  private completedToolEvents = new Map<string, AgentEvent>();
+  private pendingParallelToolCalls = new Set<string>();
   private pendingUiResponses = new Map<string, PendingUiResponse>();
   private pendingUiRequests = new Map<string, AgentEvent>();
   private activeCustomUis = new Map<string, ActiveCustomUi>();
@@ -390,6 +396,8 @@ export class AgentSessionWrapper {
   private agentRunNeedsCompletion = false;
   // Whether the last run ended because it was stopped (pi 1.1's `agent_settled.aborted`), not finished.
   private lastRunAborted = false;
+  private readonly manualCompactionWork = new Set<Promise<void>>();
+  private readonly compactWithoutContinuation: AgentSessionLike["compact"] | undefined;
   private promptAdmissionTail: Promise<void> = Promise.resolve();
   private extensionsBound = false;
   private extensionBindingPromise: Promise<void> | null = null;
@@ -466,6 +474,56 @@ export class AgentSessionWrapper {
     this.builtOnThinkingLevel = inner.agent?.state?.thinkingLevel;
     this.startupNotices = options.startupIssues ? [] : null;
     for (const issue of options.startupIssues ?? []) this.notifyIssue(issue);
+
+    // An extension's ctx.compact() calls the public SDK method, and its onComplete may
+    // start the next turn. Observe the call itself: agent_settled and the interrupted
+    // prompt can finish before compaction_start, so neither can tell us whether the
+    // abort is terminal. The wrapper's own `compact` command has no completion callback
+    // and keeps the untracked method: prompts parked meanwhile report their own prompt_done.
+    const compact = inner.compact?.bind(inner);
+    this.compactWithoutContinuation = compact;
+    if (compact) inner.compact = (...args) => this.trackManualCompactionWork(compact(...args));
+    const prompt = inner.prompt?.bind(inner);
+    if (prompt) inner.prompt = (...args) => {
+      // A completion callback can submit a prompt whose async input/auth preflight
+      // has not set isStreaming yet. Follow that promise as well as active runs.
+      const duringCompaction = this.manualCompactionWork.size > 0 && !inner.isCompacting;
+      const operation = prompt(...args);
+      return duringCompaction ? this.trackManualCompactionWork(operation) : operation;
+    };
+  }
+
+  private trackManualCompactionWork<T>(operation: Promise<T>): Promise<T> {
+    const { promise, resolve } = Promise.withResolvers<void>();
+    this.manualCompactionWork.add(promise);
+    const finish = () => {
+      this.manualCompactionWork.delete(promise);
+      resolve();
+      this.notifyAgentRunCompleteIfIdle();
+      this.checkExtensionShutdown();
+    };
+    // Attach after the caller: the SDK's await in ctx.compact() must get to run
+    // onComplete (or onError) before we decide whether its session will continue.
+    queueMicrotask(() => { void operation.then(finish, finish); });
+    return operation;
+  }
+
+  waitForCompactionContinuation(): Promise<void> | undefined {
+    if (this.manualCompactionWork.size === 0) return;
+    return this.drainManualCompactionWork();
+  }
+
+  private async drainManualCompactionWork(): Promise<void> {
+    for (;;) {
+      if (this.manualCompactionWork.size > 0) {
+        await Promise.all(this.manualCompactionWork);
+      } else if (this.inner.isStreaming) {
+        // sendCustomMessage({ triggerTurn: true }) starts a run without prompt().
+        await this.inner.waitForIdle();
+      } else {
+        return;
+      }
+    }
   }
 
   get sessionId(): string {
@@ -535,7 +593,8 @@ export class AgentSessionWrapper {
   }
 
   isRunning(): boolean {
-    return this._alive && (this.pendingPromptCount > 0 || this.inner.isStreaming || this.inner.isCompacting || this.shellRunning);
+    return this._alive && (this.pendingPromptCount > 0 || this.inner.isStreaming || this.inner.isCompacting
+      || this.manualCompactionWork.size > 0 || this.shellRunning);
   }
 
   /**
@@ -666,6 +725,8 @@ export class AgentSessionWrapper {
         invalidateSessionListCache();
         // Every tool call of the run has finished; nothing is left to replay.
         this.activeToolEvents.clear();
+        this.completedToolEvents.clear();
+        this.pendingParallelToolCalls.clear();
       }
       // A name from setSessionName(), an extension's included: a title generated
       // in the background lands after the run's agent_end, a command's with no
@@ -677,11 +738,16 @@ export class AgentSessionWrapper {
         // Prompts parked while compaction ran go out now, FIFO, whatever its outcome (as the TUI).
         this.flushParkedPrompts();
       }
+      const liveEvent = event.type === "tool_execution_end"
+        ? liveToolExecutionEvent(event, this.activeToolEvents.size > 0
+          || (!this.inner.agent.signal?.aborted && this.pendingParallelToolCalls.size > 0))
+        : event;
       this.emit(
-        event.type === "message_end" ? this.withTranscriptNotices(event)
-          : event.type === "agent_settled" ? this.withSubagentsActive(event)
-            : event,
+        liveEvent.type === "message_end" ? this.withTranscriptNotices(liveEvent)
+          : liveEvent.type === "agent_settled" ? this.withSubagentsActive(liveEvent)
+            : liveEvent,
       );
+      if (event.type === "message_end") this.announceUserMessageEntry(event.message);
       if (event.type === "agent_settled") this.notifyAgentRunCompleteIfIdle();
       this.checkExtensionShutdown();
     });
@@ -689,8 +755,32 @@ export class AgentSessionWrapper {
   }
 
   /**
-   * An assistant `message_end` with the notices pi's TUI shows under
-   * `showCacheMissNotices` (#1265), as `transcriptNotices` beside the message.
+   * `user_message_entry` with the entry id of a user message just delivered (the run's prompt,
+   * a steer, a follow-up). pi appends the message only after emitting its `message_end`, in the
+   * same synchronous step, and announces the id to no one; the chat's "New session" on that
+   * message needs it before the run's end reads the file (#1746). The entry holds the very
+   * message object the event carried. `timestamp` is the message's, for the page to match it.
+   */
+  private announceUserMessageEntry(message: unknown): void {
+    if (this.listeners.size === 0 || (message as { role?: unknown } | undefined)?.role !== "user") return;
+    queueMicrotask(() => {
+      const branch = this.inner.sessionManager.getBranch() as unknown as SessionEntry[];
+      for (let i = branch.length - 1; i >= 0; i--) {
+        const entry = branch[i];
+        if (entry.type !== "message" || (entry as SessionMessageEntry).message !== message) continue;
+        this.emit({
+          type: "user_message_entry",
+          entryId: entry.id,
+          timestamp: (message as { timestamp?: unknown }).timestamp,
+        });
+        return;
+      }
+    });
+  }
+
+  /**
+   * An assistant `message_end` with the notices pi's TUI shows under its
+   * `notices.*` settings (#1265), as `transcriptNotices` beside the message.
    * The message itself is left alone: pi writes that object to the file.
    */
   private withTranscriptNotices(event: AgentEvent): AgentEvent {
@@ -698,14 +788,16 @@ export class AgentSessionWrapper {
     if (this.listeners.size === 0 || message?.role !== "assistant") return event;
     try {
       const manager = this.inner.sessionManager;
-      if (!readShowCacheMissNotices(manager.getCwd())) return event;
+      const settings = readNoticeSettings(manager.getCwd());
+      // The only two kinds a reply carries.
+      if (!settings.cacheMisses && !settings.reasoningDrops) return event;
       const entries = manager.getEntries() as unknown as SessionEntry[];
-      const notices = collectLiveAssistantNotices(
+      const notices = shownNotices(collectLiveAssistantNotices(
         entries,
         manager.getBranch() as unknown as SessionEntry[],
         message,
         withSessionPrices(entries, this.inner.modelRuntime),
-      );
+      ), settings);
       return notices.length > 0 ? { ...event, transcriptNotices: notices } : event;
     } catch (error) {
       console.warn("[pi-web] transcript notices failed:", error instanceof Error ? error.message : error);
@@ -714,13 +806,21 @@ export class AgentSessionWrapper {
   }
 
   /**
-   * Keep the start and the latest update of each running tool call for onEvent()
-   * to replay. Calls a tool makes itself (a codemode script's, which carry
-   * `parentToolCallId`) are left out: a reconnecting client would show each as a
-   * top-level tool, and the parent's own update already reports them. A nested
-   * end can still arrive after its parent's, and is ignored like the rest.
+   * Keep running calls and completed results for reconnect, before slimming live events.
+   * The full parallel batch includes calls that have not started yet: preparation
+   * can finish a call before the next start. Nested calls belong to their parent.
    */
   private trackActiveToolEvent(event: AgentEvent): void {
+    if (event.type === "message_end") {
+      const message = event.message as { role?: string; toolCallId?: string; content?: unknown; stopReason?: unknown } | undefined;
+      if (message?.role === "assistant") {
+        this.pendingParallelToolCalls = parallelToolCallIds(message.content, this.inner.agent, message.stopReason);
+      } else if (message?.role === "toolResult" && message.toolCallId) {
+        this.completedToolEvents.delete(message.toolCallId);
+        this.pendingParallelToolCalls.delete(message.toolCallId);
+      }
+      return;
+    }
     const toolCallId = event.toolCallId;
     if (typeof toolCallId !== "string" || isNestedToolExecutionEvent(event)) return;
     if (event.type === "tool_execution_start") {
@@ -729,6 +829,8 @@ export class AgentSessionWrapper {
       const active = this.activeToolEvents.get(toolCallId);
       if (active) active.update = event;
     } else if (event.type === "tool_execution_end") {
+      if (event.result) this.completedToolEvents.set(toolCallId, event);
+      this.pendingParallelToolCalls.delete(toolCallId);
       this.activeToolEvents.delete(toolCallId);
       const nestedPrefix = `${toolCallId}/`;
       for (const id of this.activeToolEvents.keys()) {
@@ -858,9 +960,12 @@ export class AgentSessionWrapper {
         streamingBehavior: entry.streamingBehavior ?? "steer",
         preflightResult: (result) => {
           disposition = result;
+          if (result === "started") this.recordModelOnBranch();
           release();
         },
       });
+      const continuation = this.waitForCompactionContinuation();
+      if (continuation) await continuation;
     } catch (error) {
       failure = error;
     }
@@ -1115,6 +1220,23 @@ export class AgentSessionWrapper {
     return { cancelled: false };
   }
 
+  /**
+   * When a prompt starts a run, make the branch record the model the session runs on. A
+   * `model_change` made on a branch that an edit-and-resend or a tree move then left stays
+   * on that dead branch, and a side chat or a reopened session reads the model from the
+   * branch's latest `model_change` (#1715). Called from pi's `preflightResult("started")`,
+   * right before pi's own `_recordSelection()`, which records only virtual selections
+   * because its resume also reads the latest response's model, which pi-web does not.
+   */
+  private recordModelOnBranch(): void {
+    const model = this.inner.model;
+    if (!model) return;
+    const manager = this.inner.sessionManager;
+    const recorded = getLatestModelChange(manager.getBranch() as unknown as SessionEntry[]);
+    if (!recorded || (recorded.provider === model.provider && recorded.modelId === model.id)) return;
+    manager.appendModelChange(model.provider, model.id);
+  }
+
   /** The first prompt names a side chat that still has the name it started with. */
   private nameSideChat(message: unknown): void {
     if (this.inner.sessionManager.getSessionName() !== SIDE_SESSION_NAME || typeof message !== "string") return;
@@ -1257,6 +1379,7 @@ export class AgentSessionWrapper {
       listener({ ...start, elapsedMs: Math.max(0, Math.round(now - startedAt)) });
       if (update) listener(update);
     }
+    for (const event of this.completedToolEvents.values()) listener(event);
     for (const event of this.startupNotices ?? []) listener(event);
     return () => {
       this.listeners.delete(listener);
@@ -1354,9 +1477,10 @@ export class AgentSessionWrapper {
       }
       // A session whose folder was deleted outside pi-web stays readable, but a
       // run there would reach the model only for its tools to fail (and `write`
-      // to recreate the folder). The pi CLI does not resume such a session
-      // either; refuse as /api/agent/new does. (A `!` command already refuses.)
-      // Typed, so the route names the folder for the composer (#1422).
+      // to recreate the folder). The pi CLI asks to continue elsewhere or fork
+      // instead; refuse as /api/agent/new does, and the composer offers the fork.
+      // (A `!` command already refuses.) Typed, so the route names the folder for
+      // the composer (#1422).
       if (type === "prompt" && !existsSync(this.cwd)) {
         throw cwdMissingError(this.cwd);
       }
@@ -1368,6 +1492,31 @@ export class AgentSessionWrapper {
         // this submission starts a run or joins its streaming queue.
         const releaseAdmission = await this.acquirePromptAdmission();
         try {
+          // The composer's # session references (`[title](#session:uuid)`) expand
+          // here, once: the model, a parked prompt and the transcript all see the
+          // same expanded content (lib/session-reference.ts). Protected tokens
+          // (inside code or escaped) stay as text. After admission, so a prompt
+          // whose referenced file is still being read is never overtaken by one
+          // sent after it; inside the try, so a failed read releases admission.
+          const promptMessage = await expandSessionReferences(
+            command.message as string,
+            (id, maxChars) => resolveSessionReferenceForSend(
+              id,
+              {
+                openSessionManager,
+                // A cached path can outlive its file: opening it would quote an
+                // empty new session instead of saying the file is gone.
+                resolveSessionPath: async (id) => {
+                  const filePath = await resolveSessionPath(id);
+                  return filePath && existsSync(filePath) ? filePath : null;
+                },
+                // The block's tooltip reads this, so it matches the sidebar's own
+                // "last changed" for the same session.
+                modifiedAt: async (filePath) => statSync(filePath).mtime.toISOString(),
+              },
+              maxChars,
+            ),
+          );
           // A steer or follow-up joins the run beside a `!` command, as pi's TUI
           // queues it; only a prompt that would start a run waits for the command.
           if (this.shellRunning && !(command.streamingBehavior && this.inner.isStreaming)) {
@@ -1451,7 +1600,7 @@ export class AgentSessionWrapper {
           if (!streamingBehavior) this.lastRunAborted = false;
           let prompt: Promise<void>;
           try {
-            prompt = this.inner.prompt(command.message as string, {
+            prompt = this.inner.prompt(promptMessage, {
               ...(promptImages?.length ? { images: promptImages } : {}),
               ...(streamingBehavior ? { streamingBehavior } : {}),
               source: "rpc",
@@ -1459,17 +1608,22 @@ export class AgentSessionWrapper {
               // validation and extension preflight have accepted the submission.
               // Every disposition (handled, queued, started) is an acceptance; a
               // rejected prompt never calls this and rejects `prompt` instead.
-              preflightResult: () => acceptPreflight(),
+              preflightResult: (disposition) => {
+                if (disposition === "started") this.recordModelOnBranch();
+                acceptPreflight();
+              },
             });
           } catch (error) {
             finishPrompt();
             throw error;
           }
 
-          void prompt.then(() => {
+          void prompt.then(async () => {
             // Compatibility fallback if a future SDK resolves without invoking
             // the internal callback. This waits for the run, but never acks early.
             acceptPreflight();
+            const continuation = this.waitForCompactionContinuation();
+            if (continuation) await continuation;
             finishPrompt();
             if (!streamingBehavior) this.emit(this.promptDoneEvent());
           }, (error) => {
@@ -1481,7 +1635,7 @@ export class AgentSessionWrapper {
             // so the wrapper cannot idle out from under it.
             if (!preflightAccepted && isCompactionInProgressError(error)) {
               this.parkDuringCompaction({
-                message: command.message as string,
+                message: promptMessage,
                 images: promptImages,
                 streamingBehavior,
                 settle: finishPrompt,
@@ -1773,7 +1927,7 @@ export class AgentSessionWrapper {
         this.renewExtensionUiStop();
         try {
           return await this.withFinalIdleReset(() =>
-            this.inner.compact(command.customInstructions as string | undefined)
+            (this.compactWithoutContinuation ?? this.inner.compact.bind(this.inner))(command.customInstructions as string | undefined)
           );
         } finally {
           invalidateSessionListCache();
@@ -2032,6 +2186,8 @@ export class AgentSessionWrapper {
     this.pendingUiResponses.clear();
     this.pendingUiRequests.clear();
     this.activeToolEvents.clear();
+    this.completedToolEvents.clear();
+    this.pendingParallelToolCalls.clear();
     this.clearExtensionWidgets(false);
 
     const finishDispose = () => {
@@ -2517,10 +2673,13 @@ export class AgentSessionWrapper {
     request: ExtensionUiRequestBody,
     defaultValue: T,
     parseResponse: (response: ExtensionUiResponse) => T,
-    timeout?: number,
+    rawTimeout?: number,
     signal?: AbortSignal,
   ): Promise<T> {
     if (signal?.aborted) return Promise.resolve(defaultValue);
+    // As pi's TUI (`opts.timeout > 0`, counted down in seconds): only a positive number is a
+    // deadline, and a huge one (Infinity, Number.MAX_SAFE_INTEGER) waits for the person.
+    const timeout = typeof rawTimeout === "number" && rawTimeout > 0 && Number.isFinite(rawTimeout) ? rawTimeout : undefined;
     // Past destroy() nobody can answer: a session_start the shutdown deadline cut short goes on,
     // and is refused at once, as after Stop. A cancelled answer would let a handler that asks
     // until it is answered spin the server forever.
@@ -2530,11 +2689,12 @@ export class AgentSessionWrapper {
     const abortSignal = signal ? AbortSignal.any([signal, stopSignal]) : stopSignal;
 
     const id = randomUUID();
+    const deadline = Date.now() + (timeout ?? 0);
     const fullRequest = {
       type: "extension_ui_request",
       id,
       ...request,
-      ...(timeout ? { timeout, expiresAt: Date.now() + timeout } : {}),
+      ...(timeout ? { timeout, expiresAt: deadline } : {}),
     };
 
     return new Promise((resolve, reject) => {
@@ -2556,7 +2716,14 @@ export class AgentSessionWrapper {
       };
       const onAbort = () => settle(defaultValue);
 
-      if (timeout) timeoutId = setTimeout(() => settle(defaultValue), timeout);
+      // setTimeout fires after 1 ms past 2^31 - 1 ms, so a long deadline is waited in steps.
+      const armTimeout = () => {
+        const left = deadline - Date.now();
+        timeoutId = left <= MAX_TIMER_MS
+          ? setTimeout(() => settle(defaultValue), Math.max(0, left))
+          : setTimeout(armTimeout, MAX_TIMER_MS);
+      };
+      if (timeout) armTimeout();
       abortSignal.addEventListener("abort", onAbort, { once: true });
 
       this.pendingUiRequests.set(id, fullRequest as AgentEvent);
@@ -2571,28 +2738,28 @@ export class AgentSessionWrapper {
   private createExtensionUiContext(): ExtensionUiContextLike {
     return {
       select: (title, options, opts) => this.requestExtensionUi(
-        { method: "select", title, options, ...(opts?.timeout ? { timeout: opts.timeout } : {}) },
+        { method: "select", title, options },
         undefined,
         (response) => "value" in response ? response.value : undefined,
         opts?.timeout,
         opts?.signal,
       ),
       confirm: (title, message, opts) => this.requestExtensionUi(
-        { method: "confirm", title, message, ...(opts?.timeout ? { timeout: opts.timeout } : {}) },
+        { method: "confirm", title, message },
         false,
         (response) => "confirmed" in response ? response.confirmed : false,
         opts?.timeout,
         opts?.signal,
       ),
       input: (title, placeholder, opts) => this.requestExtensionUi(
-        { method: "input", title, ...(placeholder !== undefined ? { placeholder } : {}), ...(opts?.timeout ? { timeout: opts.timeout } : {}) },
+        { method: "input", title, ...(placeholder !== undefined ? { placeholder } : {}) },
         undefined,
         (response) => "value" in response ? response.value : undefined,
         opts?.timeout,
         opts?.signal,
       ),
       editor: (title, prefill, opts) => this.requestExtensionUi(
-        { method: "editor", title, ...(prefill !== undefined ? { prefill } : {}), ...(opts?.timeout ? { timeout: opts.timeout } : {}) },
+        { method: "editor", title, ...(prefill !== undefined ? { prefill } : {}) },
         undefined,
         (response) => "value" in response ? response.value : undefined,
         opts?.timeout,
@@ -3003,15 +3170,6 @@ function closingRpcSessionWait(sessionId: string): Promise<void> | null {
   return wait.done ? null : wait.promise;
 }
 
-function normalizeRpcCwd(cwd: string): string {
-  const resolvedCwd = resolve(cwd);
-  try {
-    return realpathSync(resolvedCwd);
-  } catch {
-    return resolvedCwd;
-  }
-}
-
 function getStartingSessionCwds(): Map<string, number> {
   if (!globalThis.__piStartingSessionCwds) globalThis.__piStartingSessionCwds = new Map();
   return globalThis.__piStartingSessionCwds;
@@ -3019,7 +3177,7 @@ function getStartingSessionCwds(): Map<string, number> {
 
 function trackStartingSession(cwd: string): () => void {
   const startingCwds = getStartingSessionCwds();
-  const key = normalizeRpcCwd(cwd);
+  const key = realPathOrResolved(cwd);
   startingCwds.set(key, (startingCwds.get(key) ?? 0) + 1);
   return () => {
     const remaining = (startingCwds.get(key) ?? 1) - 1;
@@ -3030,6 +3188,36 @@ function trackStartingSession(cwd: string): () => void {
 
 export function getRpcSession(sessionId: string): AgentSessionWrapper | undefined {
   return getRegistry().get(sessionId);
+}
+
+/**
+ * The session's wrapper while it is alive, for reads that should come from its in-memory
+ * `SessionManager` rather than the file. A closing wrapper is left out: its replacement may
+ * already be reading the file.
+ */
+export function getLiveRpcSession(sessionId: string): AgentSessionWrapper | undefined {
+  const rpc = getRpcSession(sessionId);
+  return rpc?.isAlive() ? rpc : undefined;
+}
+
+/**
+ * Settings › General changed pi's global `steeringMode` or `followUpMode`: each open
+ * session takes the values its own settings resolve now (a project's .pi/settings.json
+ * still wins), as pi's TUI applies its /settings choice to the running session at once.
+ * Queued messages stay queued; they go out by the new mode.
+ */
+export async function applyQueueModesToLiveSessions(): Promise<void> {
+  await Promise.all(Array.from(getRegistry().values(), async (wrapper) => {
+    if (!wrapper.isAlive()) return;
+    const { settingsManager, agent } = wrapper.inner;
+    try {
+      await settingsManager.reload();
+      agent.steeringMode = settingsManager.getSteeringMode();
+      agent.followUpMode = settingsManager.getFollowUpMode();
+    } catch {
+      // Unreadable settings keep this session's mode until it reloads.
+    }
+  }));
 }
 
 /**
@@ -3151,8 +3339,8 @@ export async function setRpcSessionTools(
     ...(toolNames !== undefined ? { toolNames } : {}),
     ...(model ? { initialModel: { provider: model.provider, modelId: model.id } } : {}),
     allowInitialModelFallback: true,
-    ...(currentThinkingLevel && THINKING_LEVEL_NAMES.has(currentThinkingLevel as ThinkingLevel)
-      ? { thinkingLevel: currentThinkingLevel as ThinkingLevel }
+    ...(isThinkingLevel(currentThinkingLevel)
+      ? { thinkingLevel: currentThinkingLevel }
       : {}),
   });
   return { session: started.session, sessionId: started.realSessionId, recreated: true };
@@ -3261,17 +3449,17 @@ export function getRpcSessionInfos(options: { includeTransient?: boolean } = {})
 }
 
 export function hasBusyRpcSessionForCwd(cwd: string): boolean {
-  const targetCwd = normalizeRpcCwd(cwd);
+  const targetCwd = realPathOrResolved(cwd);
   if (getStartingSessionCwds().has(targetCwd)) return true;
   return Array.from(getRegistry().values()).some(
-    (session) => normalizeRpcCwd(session.cwd) === targetCwd && session.isRunning(),
+    (session) => realPathOrResolved(session.cwd) === targetCwd && session.isRunning(),
   );
 }
 
 export async function destroyRpcSessionsForCwd(cwd: string): Promise<number> {
-  const targetCwd = normalizeRpcCwd(cwd);
+  const targetCwd = realPathOrResolved(cwd);
   const sessions = Array.from(getRegistry().values()).filter(
-    (session) => normalizeRpcCwd(session.cwd) === targetCwd,
+    (session) => realPathOrResolved(session.cwd) === targetCwd,
   );
   await Promise.all(sessions.map((session) => session.shutdown()));
   return sessions.length;
@@ -3594,7 +3782,7 @@ export async function startRpcSession(
       settingsManager,
       resourceLoaderOptions: subagentResources
         ? {
-            ...subagentExtensionLoaderOptions(subagentResources),
+            ...subagentExtensionLoaderOptions(subagentResources, configuredPackageRoots(sessionCwd, agentDir, settingsManager)),
             ...skillsBinding!.loaderOptions,
             extensionFactories: subagentExtensionFactories,
             noPromptTemplates: true,

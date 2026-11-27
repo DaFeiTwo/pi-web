@@ -35,6 +35,9 @@ import { readTextPreviewChunk } from "@/lib/text-preview";
 import { registerFileWatch } from "@/lib/file-watch-registry";
 import { FILE_WATCH_HEARTBEAT_MS } from "@/lib/file-version";
 import { pageStreamLabel, registerPageStream } from "@/lib/page-stream-registry";
+import { contentDisposition } from "@/lib/content-disposition";
+import { frameAncestorsDirective } from "@/lib/frame-ancestors";
+import { errorMessage } from "@/lib/errors";
 
 const FILE_REQUEST_TYPES = ["list", "read", "download", "meta", "preview", "watch"] as const;
 type FileRequestType = typeof FILE_REQUEST_TYPES[number];
@@ -240,7 +243,7 @@ export async function POST(
       try {
         bytes = Buffer.from(await file.arrayBuffer());
       } catch (error) {
-        errors.push({ name: file.name, error: error instanceof Error ? error.message : String(error) });
+        errors.push({ name: file.name, error: errorMessage(error) });
         continue;
       }
 
@@ -254,7 +257,7 @@ export async function POST(
         }
         uploaded.push(file.name);
       } catch (error) {
-        errors.push({ name: file.name, error: error instanceof Error ? error.message : String(error) });
+        errors.push({ name: file.name, error: errorMessage(error) });
       }
     }
 
@@ -263,7 +266,7 @@ export async function POST(
       { status: errors.length > 0 ? 207 : 200 },
     );
   } catch (error) {
-    return NextResponse.json({ error: error instanceof Error ? error.message : String(error) }, { status: 500 });
+    return NextResponse.json({ error: errorMessage(error) }, { status: 500 });
   }
 }
 
@@ -277,6 +280,8 @@ function createFileBodyStream(filePath: string, range?: { start: number; end: nu
         if (closed) return;
         try {
           controller.enqueue(new Uint8Array(chunk));
+          // A client slower than the disk must not make the whole file pile up in memory.
+          if ((controller.desiredSize ?? 1) <= 0) fileStream.pause();
         } catch {
           closed = true;
           fileStream.destroy();
@@ -301,6 +306,9 @@ function createFileBodyStream(filePath: string, range?: { start: number; end: nu
         }
       });
     },
+    pull() {
+      if (!closed) fileStream.resume();
+    },
     cancel() {
       closed = true;
       fileStream.destroy();
@@ -308,25 +316,14 @@ function createFileBodyStream(filePath: string, range?: { start: number; end: nu
   });
 }
 
-function encodeHeaderValue(value: string): string {
-  return encodeURIComponent(value).replace(/[!'()*]/g, (ch) =>
-    `%${ch.charCodeAt(0).toString(16).toUpperCase()}`
-  );
-}
-
-function getContentDisposition(filePath: string, asDownload = false): string {
-  const disposition = asDownload ? "attachment" : "inline";
-  const fileName = path.basename(filePath);
-  const fallback = fileName.replace(/[^\x20-\x7E]|["\\;\r\n]/g, "_") || "download";
-  return `${disposition}; filename="${fallback}"; filename*=UTF-8''${encodeHeaderValue(fileName)}`;
-}
-
 function streamFile(filePath: string, stat: fs.Stats, contentType: string, rangeHeader: string | null, asDownload = false): Response {
   const headers: Record<string, string> = {
     "Content-Type": contentType,
-    "Cache-Control": "no-cache",
+    // no-transform: Next gzips compressible route responses (SVG among them), a 206 included,
+    // which turns a byte range into the range of a different body; file bytes go out as stored.
+    "Cache-Control": "no-cache, no-transform",
     "Accept-Ranges": "bytes",
-    "Content-Disposition": getContentDisposition(filePath, asDownload),
+    "Content-Disposition": contentDisposition(asDownload ? "attachment" : "inline", path.basename(filePath), "download"),
     "X-Content-Type-Options": "nosniff",
   };
   // SVG is the only preview type a browser executes as a document. A
@@ -336,7 +333,7 @@ function streamFile(filePath: string, stat: fs.Stats, contentType: string, range
   // <img> preview embedding ignores them.
   if (contentType === "image/svg+xml") {
     headers["Content-Security-Policy"] =
-      "default-src 'none'; img-src data:; style-src 'unsafe-inline'; base-uri 'none'; form-action 'none'; frame-ancestors 'self'";
+      `default-src 'none'; img-src data:; style-src 'unsafe-inline'; base-uri 'none'; form-action 'none'; ${frameAncestorsDirective()}`;
     headers["Referrer-Policy"] = "no-referrer";
   }
 
@@ -584,7 +581,7 @@ export async function GET(
         headers: {
           "Content-Type": "text/html; charset=utf-8",
           "Cache-Control": "no-cache",
-          "Content-Security-Policy": "default-src 'none'; img-src data:; style-src 'unsafe-inline'; base-uri 'none'; form-action 'none'; frame-ancestors 'self'",
+          "Content-Security-Policy": `default-src 'none'; img-src data:; style-src 'unsafe-inline'; base-uri 'none'; form-action 'none'; ${frameAncestorsDirective()}`,
           "Referrer-Policy": "no-referrer",
           "X-Content-Type-Options": "nosniff",
         },

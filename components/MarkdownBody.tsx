@@ -4,13 +4,15 @@ import { createContext, Fragment, memo, useContext, useMemo, useState, type Comp
 import ReactMarkdown, { type Components, type ExtraProps } from "react-markdown";
 import { useI18n } from "@/hooks/useI18n";
 import { copyText } from "@/lib/clipboard";
-import { parsePdfPageFragment, resolveLocalFileHref, shouldOpenLocalFileInApp } from "@/lib/file-links";
+import { resolveLocalFileHref, resolveLocalFileLink, shouldOpenLocalFileInApp, type FileLinkTarget } from "@/lib/file-links";
 import { encodeFilePathForApi } from "@/lib/file-paths";
 import { isAudioPath, isVideoPath } from "@/lib/file-types";
 import { isExternalMarkdownHref, jumpToMarkdownFragment, markdownAppUrlTransform, markdownDocumentRehypePlugins, markdownRehypePlugins, markdownRemarkPlugins, markdownTextLayoutRemarkPlugins, markdownUrlTransform, markdownUserRemarkPlugins, normalizeDisplayMath } from "@/lib/markdown";
 import { parseFenceBlock, splitMarkdownBlocks } from "@/lib/markdown-blocks";
+import { isPlantUmlLang } from "@/lib/plantuml";
 import { ImagePreview } from "./ImagePreview";
 import { MermaidBlock, CodeBlock } from "./MermaidBlock";
+import { PlantUmlBlock } from "./PlantUmlBlock";
 import { SvgBlock } from "./SvgBlock";
 
 const MarkdownLinkContext = createContext(false);
@@ -20,7 +22,7 @@ interface MarkdownBodyProps {
   className?: string;
   isStreaming?: boolean;
   cwd?: string;
-  onOpenFile?: (filePath: string, page?: number) => void;
+  onOpenFile?: (filePath: string, target?: FileLinkTarget) => void;
   /** A document reader's own links: relative paths and `#headings` stay in the reader. */
   onNavigateLink?: (href: string) => void;
   /** Text the user typed: every line ending is a line break and raw HTML shows as text, as in pi's TUI. */
@@ -111,10 +113,11 @@ const MarkdownBlock = memo(function MarkdownBlock({ markdown, remarkPlugins, url
   );
 });
 
-/** A fenced block: a diagram's block for mermaid and svg, else a code block. */
+/** A fenced block: a diagram's block for mermaid, svg and plantuml, else a code block. */
 function renderFence(lang: string, code: string, isStreaming: boolean | undefined) {
   if (lang === "mermaid") return <MermaidBlock code={code} isStreaming={isStreaming} defaultPreview />;
   if (lang === "svg") return <SvgBlock code={code} isStreaming={isStreaming} />;
+  if (isPlantUmlLang(lang)) return <PlantUmlBlock code={code} lang={lang} isStreaming={isStreaming} />;
   return <CodeBlock code={code} lang={lang} isStreaming={isStreaming} />;
 }
 
@@ -170,9 +173,9 @@ export const MarkdownBody = memo(function MarkdownBody({ children, className, is
           </MarkdownLinkContext.Provider>
         );
       }
-      const filePath = onOpenFile ? resolveLocalFileHref(href, cwd) : null;
+      const fileLink = onOpenFile ? resolveLocalFileLink(href, cwd) : null;
       const openFile = onOpenFile;
-      if (!filePath || !openFile) {
+      if (!fileLink || !openFile) {
         return (
           <MarkdownLinkContext.Provider value={true}>
             <a href={href} {...props} target="_blank" rel="noopener noreferrer">
@@ -187,7 +190,7 @@ export const MarkdownBody = memo(function MarkdownBody({ children, className, is
         const target = event.currentTarget.getAttribute("target");
         if (target && target !== "_self") return;
         event.preventDefault();
-        openFile(filePath, parsePdfPageFragment(href) ?? undefined);
+        openFile(fileLink.path, fileLink.target);
       };
 
       return (
